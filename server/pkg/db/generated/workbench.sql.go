@@ -165,6 +165,19 @@ func (q *Queries) GetIntegrationIngestAttempt(ctx context.Context, arg GetIntegr
 	return i, err
 }
 
+const hasAnyTaskHistoryForIssue = `-- name: HasAnyTaskHistoryForIssue :one
+SELECT EXISTS (
+    SELECT 1 FROM agent_task_queue t WHERE t.issue_id = $1
+)
+`
+
+func (q *Queries) HasAnyTaskHistoryForIssue(ctx context.Context, issueID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasAnyTaskHistoryForIssue, issueID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const listIssueExternalRecordBindings = `-- name: ListIssueExternalRecordBindings :many
 SELECT
     b.id AS binding_id,
@@ -240,6 +253,54 @@ func (q *Queries) ListIssueExternalRecordBindings(ctx context.Context, arg ListI
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockIssueForNeverEnqueuedReconciliation = `-- name: LockIssueForNeverEnqueuedReconciliation :one
+SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority, i.assignee_type, i.assignee_id, i.creator_type, i.creator_id, i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position, i.due_date, i.created_at, i.updated_at, i.number, i.project_id, i.origin_type, i.origin_id, i.first_executed_at, i.start_date, i.metadata, i.stage
+FROM issue i
+WHERE i.id = $1
+  AND i.workspace_id = $2
+FOR UPDATE
+`
+
+type LockIssueForNeverEnqueuedReconciliationParams struct {
+	IssueID     pgtype.UUID `json:"issue_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+// The issue row lock serializes compensation for one issue. Callers check task
+// history only after acquiring this lock, in the same transaction.
+func (q *Queries) LockIssueForNeverEnqueuedReconciliation(ctx context.Context, arg LockIssueForNeverEnqueuedReconciliationParams) (Issue, error) {
+	row := q.db.QueryRow(ctx, lockIssueForNeverEnqueuedReconciliation, arg.IssueID, arg.WorkspaceID)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Title,
+		&i.Description,
+		&i.Status,
+		&i.Priority,
+		&i.AssigneeType,
+		&i.AssigneeID,
+		&i.CreatorType,
+		&i.CreatorID,
+		&i.ParentIssueID,
+		&i.AcceptanceCriteria,
+		&i.ContextRefs,
+		&i.Position,
+		&i.DueDate,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Number,
+		&i.ProjectID,
+		&i.OriginType,
+		&i.OriginID,
+		&i.FirstExecutedAt,
+		&i.StartDate,
+		&i.Metadata,
+		&i.Stage,
+	)
+	return i, err
 }
 
 const recordOrBumpIntegrationIngestAttempt = `-- name: RecordOrBumpIntegrationIngestAttempt :one

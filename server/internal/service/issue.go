@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/events"
@@ -162,6 +164,54 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		return IssueCreateResult{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	res, postCommit, err := s.CreateInTx(ctx, tx, p, opts)
+	if err != nil {
+		return res, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return IssueCreateResult{}, fmt.Errorf("commit: %w", err)
+	}
+	return postCommit.Run(ctx), nil
+}
+
+// IssueCreatePostCommit owns the side effects that must run only after the
+// transaction containing the issue insert commits successfully.
+type IssueCreatePostCommit struct {
+	service *IssueService
+	issue   db.Issue
+	params  IssueCreateParams
+	opts    IssueCreateOpts
+	once    sync.Once
+	result  IssueCreateResult
+}
+
+// Run performs issue-created side effects exactly once for this value. Concurrent
+// callers block until the first execution finishes and receive the same result.
+func (p *IssueCreatePostCommit) Run(ctx context.Context) IssueCreateResult {
+	if p == nil {
+		return IssueCreateResult{}
+	}
+	p.once.Do(func() {
+		if p.service == nil {
+			return
+		}
+		attachments := p.service.linkAttachments(ctx, p.issue, p.params.AttachmentIDs)
+		actorID := p.opts.ActorID
+		if actorID == "" {
+			actorID = util.UUIDToString(p.issue.CreatorID)
+		}
+		p.service.publishIssueCreated(p.issue, attachments, p.params.CreatorType, actorID, p.opts)
+		p.service.captureCreatedAnalytics(p.issue, p.params.CreatorType, actorID, p.opts)
+		p.service.maybeEnqueueOnAssign(ctx, p.issue, p.params.CreatorType, actorID)
+		p.result = IssueCreateResult{Issue: p.issue, Attachments: attachments}
+	})
+	return p.result
+}
+
+// CreateInTx performs only the database-owned portion of issue creation in the
+// caller's transaction. The caller must commit before invoking postCommit.Run.
+func (s *IssueService) CreateInTx(ctx context.Context, tx pgx.Tx, p IssueCreateParams, opts IssueCreateOpts) (IssueCreateResult, *IssueCreatePostCommit, error) {
 	qtx := s.Queries.WithTx(tx)
 
 	// Resolve and validate parent / project before reading from the
@@ -176,7 +226,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			WorkspaceID: p.WorkspaceID,
 		})
 		if err != nil || !parent.ID.Valid {
-			return IssueCreateResult{}, ErrParentIssueNotFound
+			return IssueCreateResult{}, nil, ErrParentIssueNotFound
 		}
 		// Back-fill project from parent when the caller did not pin
 		// one explicitly. Matches the long-standing HTTP behavior: a
@@ -190,22 +240,22 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			ID:          projectID,
 			WorkspaceID: p.WorkspaceID,
 		}); err != nil {
-			return IssueCreateResult{}, ErrProjectNotFound
+			return IssueCreateResult{}, nil, ErrProjectNotFound
 		}
 	}
 
 	duplicate, found, err := issueguard.LockAndFindActiveDuplicate(ctx, qtx, p.WorkspaceID, projectID, p.ParentIssueID, p.Title, p.AllowDuplicate)
 	if err != nil {
-		return IssueCreateResult{}, fmt.Errorf("duplicate guard: %w", err)
+		return IssueCreateResult{}, nil, fmt.Errorf("duplicate guard: %w", err)
 	}
 	if found {
 		dup := duplicate
-		return IssueCreateResult{DuplicateIssue: &dup}, ErrActiveDuplicate
+		return IssueCreateResult{DuplicateIssue: &dup}, nil, ErrActiveDuplicate
 	}
 
 	issueNumber, err := qtx.IncrementIssueCounter(ctx, p.WorkspaceID)
 	if err != nil {
-		return IssueCreateResult{}, fmt.Errorf("increment counter: %w", err)
+		return IssueCreateResult{}, nil, fmt.Errorf("increment counter: %w", err)
 	}
 
 	// New issues sort to the top of their (workspace, status) column for
@@ -219,7 +269,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 	// to the secondary ORDER BY key.
 	newPosition, err := issueposition.NextTopPosition(ctx, tx, p.WorkspaceID, p.Status)
 	if err != nil {
-		return IssueCreateResult{}, fmt.Errorf("next top position: %w", err)
+		return IssueCreateResult{}, nil, fmt.Errorf("next top position: %w", err)
 	}
 
 	var issue db.Issue
@@ -265,25 +315,11 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		})
 	}
 	if err != nil {
-		return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
+		return IssueCreateResult{}, nil, fmt.Errorf("create issue: %w", err)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		return IssueCreateResult{}, fmt.Errorf("commit: %w", err)
-	}
-
-	attachments := s.linkAttachments(ctx, issue, p.AttachmentIDs)
-
-	actorID := opts.ActorID
-	if actorID == "" {
-		actorID = util.UUIDToString(issue.CreatorID)
-	}
-
-	s.publishIssueCreated(issue, attachments, p.CreatorType, actorID, opts)
-	s.captureCreatedAnalytics(issue, p.CreatorType, actorID, opts)
-	s.maybeEnqueueOnAssign(ctx, issue, p.CreatorType, actorID)
-
-	return IssueCreateResult{Issue: issue, Attachments: attachments}, nil
+	postCommit := &IssueCreatePostCommit{service: s, issue: issue, params: p, opts: opts}
+	return IssueCreateResult{Issue: issue}, postCommit, nil
 }
 
 // linkAttachments links the given attachment IDs to the newly created
@@ -386,6 +422,47 @@ func classifyOrigin(issue db.Issue, opts IssueCreateOpts) (source, taskID, autop
 		)
 		return analytics.SourceManual, "", ""
 	}
+}
+
+// ReconcileNeverEnqueuedIssue compensates for a committed issue create whose
+// post-commit enqueue did not complete. It holds one transaction connection for
+// the issue lock, history recheck, assignee resolution, and task insert, then
+// publishes enqueue effects only after commit.
+func (s *IssueService) ReconcileNeverEnqueuedIssue(ctx context.Context, workspaceID, issueID pgtype.UUID) error {
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin reconciliation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.Queries.WithTx(tx)
+	issue, err := qtx.LockIssueForNeverEnqueuedReconciliation(ctx, db.LockIssueForNeverEnqueuedReconciliationParams{
+		IssueID:     issueID,
+		WorkspaceID: workspaceID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock never-enqueued issue: %w", err)
+	}
+	hasHistory, err := qtx.HasAnyTaskHistoryForIssue(ctx, issue.ID)
+	if err != nil {
+		return fmt.Errorf("check issue task history: %w", err)
+	}
+	if hasHistory {
+		return nil
+	}
+	task, prepared, err := s.TaskService.PrepareNeverEnqueuedIssueTask(ctx, tx, issue)
+	if err != nil {
+		return fmt.Errorf("prepare reconciled task: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit reconciliation: %w", err)
+	}
+	if prepared {
+		s.TaskService.PublishPreparedTask(ctx, task)
+	}
+	return nil
 }
 
 func (s *IssueService) maybeEnqueueOnAssign(ctx context.Context, issue db.Issue, creatorType, actorID string) {

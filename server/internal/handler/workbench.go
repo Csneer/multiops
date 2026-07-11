@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -12,23 +13,36 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
-const maxWorkbenchTextLength = 16 * 1024
+const (
+	maxWorkbenchTextLength     = 16 * 1024
+	workbenchPostCommitTimeout = 10 * time.Second
+)
+
+type IngestCreateIssueRequest struct {
+	Description  *string `json:"description"`
+	Status       string  `json:"status"`
+	Priority     string  `json:"priority"`
+	AssigneeType *string `json:"assignee_type"`
+	AssigneeID   *string `json:"assignee_id"`
+}
 
 type IngestExternalRecordRequest struct {
-	SourceType     string  `json:"source_type"`
-	ExternalID     string  `json:"external_id"`
-	ExternalKey    *string `json:"external_key"`
-	Title          string  `json:"title"`
-	Summary        *string `json:"summary"`
-	SourceStatus   *string `json:"source_status"`
-	SourceURL      *string `json:"source_url"`
-	SchemaVersion  *string `json:"schema_version"`
-	IdempotencyKey string  `json:"idempotency_key"`
-	IssueID        *string `json:"issue_id"`
-	ObservedAt     *string `json:"observed_at"`
+	SourceType     string                    `json:"source_type"`
+	ExternalID     string                    `json:"external_id"`
+	ExternalKey    *string                   `json:"external_key"`
+	Title          string                    `json:"title"`
+	Summary        *string                   `json:"summary"`
+	SourceStatus   *string                   `json:"source_status"`
+	SourceURL      *string                   `json:"source_url"`
+	SchemaVersion  *string                   `json:"schema_version"`
+	IdempotencyKey string                    `json:"idempotency_key"`
+	IssueID        *string                   `json:"issue_id"`
+	CreateIssue    *IngestCreateIssueRequest `json:"create_issue"`
+	ObservedAt     *string                   `json:"observed_at"`
 }
 
 type ExternalRecordResponse struct {
@@ -85,6 +99,60 @@ func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
 		issueID = issue.ID
 	}
 
+	var createParams service.IssueCreateParams
+	var createOpts service.IssueCreateOpts
+	if req.CreateIssue != nil {
+		creatorID, ok := requireUserID(w, r)
+		if !ok {
+			return
+		}
+		status := req.CreateIssue.Status
+		if status == "" {
+			status = "todo"
+		}
+		priority := req.CreateIssue.Priority
+		if priority == "" {
+			priority = "none"
+		}
+		if !validateIssueEnum(w, "status", status, validIssueStatuses) || !validateIssueEnum(w, "priority", priority, validIssuePriorities) {
+			return
+		}
+		var assigneeType pgtype.Text
+		var assigneeID pgtype.UUID
+		if req.CreateIssue.AssigneeType != nil {
+			assigneeType = pgtype.Text{String: *req.CreateIssue.AssigneeType, Valid: true}
+		}
+		if req.CreateIssue.AssigneeID != nil {
+			id, ok := parseUUIDOrBadRequest(w, *req.CreateIssue.AssigneeID, "assignee_id")
+			if !ok {
+				return
+			}
+			assigneeID = id
+		}
+		if statusCode, msg := h.validateAssigneePair(r.Context(), r, h.resolveWorkspaceID(r), assigneeType, assigneeID); statusCode != 0 {
+			writeError(w, statusCode, msg)
+			return
+		}
+		createParams = service.IssueCreateParams{
+			WorkspaceID:    workspaceID,
+			Title:          strings.TrimSpace(req.Title),
+			Description:    ptrToText(req.CreateIssue.Description),
+			Status:         status,
+			Priority:       priority,
+			AssigneeType:   assigneeType,
+			AssigneeID:     assigneeID,
+			CreatorType:    "member",
+			CreatorID:      parseUUID(creatorID),
+			AllowDuplicate: true,
+		}
+		createOpts = service.IssueCreateOpts{ActorID: creatorID, AnalyticsAgentID: func() string {
+			if assigneeType.Valid && assigneeType.String == "agent" {
+				return uuidToString(assigneeID)
+			}
+			return ""
+		}()}
+	}
+
 	observedAt, err := parseIngestObservedAt(req.ObservedAt)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -115,7 +183,16 @@ func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "failed to commit ingest attempt")
 			return
 		}
-		record, err := h.Queries.GetExternalRecordInWorkspace(r.Context(), db.GetExternalRecordInWorkspaceParams{
+		postCommitCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), workbenchPostCommitTimeout)
+		defer cancel()
+		if req.CreateIssue != nil && attempt.IssueID.Valid {
+			if err := h.IssueService.ReconcileNeverEnqueuedIssue(postCommitCtx, workspaceID, attempt.IssueID); err != nil {
+				slog.Warn("reconcile duplicate ingest issue enqueue failed", "error", err, "issue_id", uuidToString(attempt.IssueID))
+				writeError(w, http.StatusInternalServerError, "failed to reconcile duplicate ingest")
+				return
+			}
+		}
+		record, err := h.Queries.GetExternalRecordInWorkspace(postCommitCtx, db.GetExternalRecordInWorkspaceParams{
 			ID:          attempt.ExternalRecordID,
 			WorkspaceID: workspaceID,
 		})
@@ -155,6 +232,18 @@ func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var issuePostCommit *service.IssueCreatePostCommit
+	if req.CreateIssue != nil {
+		created, postCommit, err := h.IssueService.CreateInTx(r.Context(), tx, createParams, createOpts)
+		if err != nil {
+			slog.Warn("create issue during ingest failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "failed to create issue")
+			return
+		}
+		issueID = created.Issue.ID
+		issuePostCommit = postCommit
+	}
+
 	if issueID.Valid {
 		if _, err := qtx.CreateIssueExternalRecordBinding(r.Context(), db.CreateIssueExternalRecordBindingParams{
 			WorkspaceID:      workspaceID,
@@ -186,6 +275,11 @@ func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to commit ingest")
 		return
+	}
+	if issuePostCommit != nil {
+		postCommitCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), workbenchPostCommitTimeout)
+		issuePostCommit.Run(postCommitCtx)
+		cancel()
 	}
 
 	response := IngestExternalRecordResponse{
@@ -242,6 +336,9 @@ func (h *Handler) ListIssueExternalRecords(w http.ResponseWriter, r *http.Reques
 }
 
 func validateIngestExternalRecordRequest(req IngestExternalRecordRequest) error {
+	if req.IssueID != nil && req.CreateIssue != nil {
+		return errors.New("issue_id and create_issue are mutually exclusive")
+	}
 	for field, value := range map[string]string{
 		"source_type":     req.SourceType,
 		"external_id":     req.ExternalID,
@@ -265,6 +362,9 @@ func validateIngestExternalRecordRequest(req IngestExternalRecordRequest) error 
 		if value != nil && len(*value) > maxWorkbenchTextLength {
 			return errors.New(field + " exceeds the maximum length")
 		}
+	}
+	if req.CreateIssue != nil && req.CreateIssue.Description != nil && len(*req.CreateIssue.Description) > maxWorkbenchTextLength {
+		return errors.New("create_issue.description exceeds the maximum length")
 	}
 	return nil
 }

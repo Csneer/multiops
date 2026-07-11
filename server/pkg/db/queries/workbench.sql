@@ -75,6 +75,20 @@ WHERE i.id = sqlc.arg('issue_id')
 ON CONFLICT (issue_id, external_record_id) DO NOTHING
 RETURNING *;
 
+-- name: LockIssueForNeverEnqueuedReconciliation :one
+-- The issue row lock serializes compensation for one issue. Callers check task
+-- history only after acquiring this lock, in the same transaction.
+SELECT i.*
+FROM issue i
+WHERE i.id = sqlc.arg('issue_id')
+  AND i.workspace_id = sqlc.arg('workspace_id')
+FOR UPDATE;
+
+-- name: HasAnyTaskHistoryForIssue :one
+SELECT EXISTS (
+    SELECT 1 FROM agent_task_queue t WHERE t.issue_id = sqlc.arg('issue_id')
+);
+
 -- name: ListIssueExternalRecordBindings :many
 SELECT
     b.id AS binding_id,

@@ -648,6 +648,82 @@ func taskErrorType(reason string) string {
 // EnqueueTaskForIssue creates a queued task for an agent-assigned issue.
 // No context snapshot is stored — the agent fetches all data it needs at
 // runtime via the multica CLI.
+// PublishPreparedTask runs the externally visible enqueue effects after the
+// transaction that inserted task has committed.
+func (s *TaskService) PublishPreparedTask(ctx context.Context, task db.AgentTaskQueue) {
+	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
+	s.NotifyTaskEnqueued(ctx, task)
+}
+
+// PrepareNeverEnqueuedIssueTask creates the compensation task using only the
+// caller's transaction connection. The issue row must already be locked and its
+// task history checked in the same transaction.
+func (s *TaskService) PrepareNeverEnqueuedIssueTask(ctx context.Context, tx pgx.Tx, issue db.Issue) (db.AgentTaskQueue, bool, error) {
+	qtx := s.Queries.WithTx(tx)
+	if !issue.AssigneeType.Valid || !issue.AssigneeID.Valid || issue.Status == "backlog" {
+		return db.AgentTaskQueue{}, false, nil
+	}
+
+	agentID := issue.AssigneeID
+	var squadID pgtype.UUID
+	isLeader := false
+	if issue.AssigneeType.String == "squad" {
+		squad, err := qtx.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{ID: issue.AssigneeID, WorkspaceID: issue.WorkspaceID})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return db.AgentTaskQueue{}, false, nil
+		}
+		if err != nil {
+			return db.AgentTaskQueue{}, false, fmt.Errorf("load squad: %w", err)
+		}
+		agentID, squadID, isLeader = squad.LeaderID, squad.ID, true
+	} else if issue.AssigneeType.String != "agent" {
+		return db.AgentTaskQueue{}, false, nil
+	}
+
+	agent, err := qtx.GetAgent(ctx, agentID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return db.AgentTaskQueue{}, false, nil
+	}
+	if err != nil {
+		return db.AgentTaskQueue{}, false, fmt.Errorf("load agent: %w", err)
+	}
+	ready, _, err := AgentReadiness(ctx, qtx, agent)
+	if err != nil {
+		return db.AgentTaskQueue{}, false, fmt.Errorf("check agent readiness: %w", err)
+	}
+	if !ready {
+		return db.AgentTaskQueue{}, false, nil
+	}
+
+	originatorUserID := pgtype.UUID{}
+	if issue.CreatorType == "member" && issue.CreatorID.Valid {
+		originatorUserID = issue.CreatorID
+	} else if issue.OriginType.Valid && issue.OriginID.Valid && (issue.OriginType.String == "quick_create" || issue.OriginType.String == "agent_create") {
+		origin, err := qtx.GetAgentTask(ctx, issue.OriginID)
+		if err == nil {
+			originatorUserID = origin.OriginatorUserID
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return db.AgentTaskQueue{}, false, fmt.Errorf("load origin task: %w", err)
+		}
+	}
+	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
+	task, err := qtx.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+		AgentID:              agentID,
+		RuntimeID:            agent.RuntimeID,
+		IssueID:              issue.ID,
+		Priority:             priorityToInt(issue.Priority),
+		IsLeaderTask:         pgtype.Bool{Bool: isLeader, Valid: isLeader},
+		SquadID:              squadID,
+		OriginatorUserID:     originatorUserID,
+		RuntimeMcpOverlay:    runtimeMCPOverlay.Overlay,
+		RuntimeConnectedApps: runtimeMCPOverlay.ConnectedApps,
+	})
+	if err != nil {
+		return db.AgentTaskQueue{}, false, fmt.Errorf("create task: %w", err)
+	}
+	return task, true, nil
+}
+
 func (s *TaskService) EnqueueTaskForIssue(ctx context.Context, issue db.Issue, triggerCommentID ...pgtype.UUID) (db.AgentTaskQueue, error) {
 	var commentID pgtype.UUID
 	if len(triggerCommentID) > 0 {
