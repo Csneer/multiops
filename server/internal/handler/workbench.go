@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -15,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/multica-ai/multica/server/internal/auth"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -22,6 +25,7 @@ import (
 const (
 	maxWorkbenchTextLength     = 16 * 1024
 	workbenchPostCommitTimeout = 10 * time.Second
+	workbenchSystemActorID     = "00000000-0000-0000-0000-000000000000"
 )
 
 type CreateConnectorRequest struct {
@@ -31,6 +35,90 @@ type CreateConnectorRequest struct {
 	Capabilities map[string]any `json:"capabilities"`
 	Config       map[string]any `json:"config"`
 	Enabled      *bool          `json:"enabled"`
+}
+
+type CreateConnectorCredentialRequest struct {
+	Name string `json:"name"`
+}
+
+type workbenchConnector struct {
+	ID            pgtype.UUID
+	WorkspaceID   pgtype.UUID
+	Key           string
+	Name          string
+	ConnectorType string
+	Capabilities  []byte
+	Enabled       bool
+	CreatedAt     pgtype.Timestamptz
+	UpdatedAt     pgtype.Timestamptz
+}
+
+type ConnectorResponse struct {
+	ID            string         `json:"id"`
+	Key           string         `json:"key"`
+	Name          string         `json:"name"`
+	ConnectorType string         `json:"connector_type"`
+	Capabilities  map[string]any `json:"capabilities"`
+	Enabled       bool           `json:"enabled"`
+	CreatedAt     string         `json:"created_at"`
+	UpdatedAt     string         `json:"updated_at"`
+}
+
+type IssueTemplateResponse struct {
+	ID                string         `json:"id"`
+	ConnectorID       string         `json:"connector_id"`
+	TemplateKey       string         `json:"template_key"`
+	Version           int32          `json:"version"`
+	Name              string         `json:"name"`
+	Enabled           bool           `json:"enabled"`
+	Priority          int32          `json:"priority"`
+	MatchSourceStatus *string        `json:"match_source_status"`
+	MatchLabelsAny    []string       `json:"match_labels_any"`
+	MatchFields       map[string]any `json:"match_fields"`
+	TitlePrefix       string         `json:"title_prefix"`
+	DescriptionSource string         `json:"description_source"`
+	Status            string         `json:"status"`
+	IssuePriority     string         `json:"issue_priority"`
+	AssigneeType      *string        `json:"assignee_type"`
+	AssigneeID        *string        `json:"assignee_id"`
+	AutoStart         bool           `json:"auto_start"`
+	CreatedAt         string         `json:"created_at"`
+}
+
+type RoutingPreviewRequest struct {
+	SourceType   string         `json:"source_type"`
+	SourceStatus *string        `json:"source_status"`
+	Labels       []string       `json:"labels"`
+	Fields       map[string]any `json:"fields"`
+	Title        string         `json:"title"`
+	Summary      *string        `json:"summary"`
+}
+
+type RoutingPreviewIssueResponse struct {
+	Title        string  `json:"title"`
+	Description  *string `json:"description"`
+	Status       string  `json:"status"`
+	Priority     string  `json:"priority"`
+	AssigneeType *string `json:"assignee_type"`
+	AssigneeID   *string `json:"assignee_id"`
+	AutoStart    bool    `json:"auto_start"`
+}
+
+type RoutingPreviewResponse struct {
+	Connector     ConnectorResponse           `json:"connector"`
+	IssueTemplate IssueTemplateResponse       `json:"issue_template"`
+	Issue         RoutingPreviewIssueResponse `json:"issue"`
+}
+
+type ConnectorCredentialResponse struct {
+	ID          string  `json:"id"`
+	ConnectorID string  `json:"connector_id"`
+	Name        string  `json:"name"`
+	TokenPrefix string  `json:"token_prefix"`
+	RevokedAt   *string `json:"revoked_at,omitempty"`
+	LastUsedAt  *string `json:"last_used_at,omitempty"`
+	CreatedAt   string  `json:"created_at"`
+	Token       string  `json:"token,omitempty"`
 }
 
 type IssueTemplateMatchRequest struct {
@@ -135,14 +223,15 @@ func (h *Handler) CreateConnector(w http.ResponseWriter, r *http.Request) {
 	}
 	capabilities, _ := json.Marshal(req.Capabilities)
 	config, _ := json.Marshal(req.Config)
-	creator, ok := requireUserID(w, r)
-	if !ok {
-		return
-	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
 	if !ok {
 		return
 	}
+	member, ok := h.requireWorkspaceRole(w, r, uuidToString(workspaceID), "workspace not found", "owner", "admin")
+	if !ok {
+		return
+	}
+	creator := uuidToString(member.UserID)
 	enabled := true
 	if req.Enabled != nil {
 		enabled = *req.Enabled
@@ -156,7 +245,414 @@ func (h *Handler) CreateConnector(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSON(w, http.StatusCreated, row)
+	writeJSON(w, http.StatusCreated, connectorResponseParts(row.ID, row.Key, row.Name, row.ConnectorType, row.Capabilities, row.Enabled, row.CreatedAt, row.UpdatedAt))
+}
+
+func (h *Handler) ListConnectors(w http.ResponseWriter, r *http.Request) {
+	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	if !ok {
+		return
+	}
+	rows, err := h.Queries.ListConnectorsInWorkspace(r.Context(), workspaceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list connectors")
+		return
+	}
+	response := make([]ConnectorResponse, len(rows))
+	for i := range rows {
+		response[i] = connectorResponseParts(rows[i].ID, rows[i].Key, rows[i].Name, rows[i].ConnectorType, rows[i].Capabilities, rows[i].Enabled, rows[i].CreatedAt, rows[i].UpdatedAt)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"connectors": response})
+}
+
+func (h *Handler) GetConnector(w http.ResponseWriter, r *http.Request) {
+	connector, ok := h.loadWorkbenchConnector(w, r, false)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, connectorResponseParts(connector.ID, connector.Key, connector.Name, connector.ConnectorType, connector.Capabilities, connector.Enabled, connector.CreatedAt, connector.UpdatedAt))
+}
+
+func (h *Handler) DisableConnector(w http.ResponseWriter, r *http.Request) {
+	connector, ok := h.loadWorkbenchConnector(w, r, false)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireWorkspaceRole(w, r, uuidToString(connector.WorkspaceID), "connector not found", "owner", "admin"); !ok {
+		return
+	}
+	row, err := h.Queries.DisableConnectorInWorkspace(r.Context(), db.DisableConnectorInWorkspaceParams{ID: connector.ID, WorkspaceID: connector.WorkspaceID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "connector not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to disable connector")
+		return
+	}
+	writeJSON(w, http.StatusOK, connectorResponseParts(row.ID, row.Key, row.Name, row.ConnectorType, row.Capabilities, row.Enabled, row.CreatedAt, row.UpdatedAt))
+}
+
+func (h *Handler) ListConnectorIssueTemplateHistory(w http.ResponseWriter, r *http.Request) {
+	connector, ok := h.loadWorkbenchConnector(w, r, false)
+	if !ok {
+		return
+	}
+	rows, err := h.Queries.ListIssueTemplateHistory(r.Context(), db.ListIssueTemplateHistoryParams{WorkspaceID: connector.WorkspaceID, ConnectorID: connector.ID})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list issue templates")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"issue_templates": issueTemplateResponses(rows)})
+}
+
+func (h *Handler) ListConnectorActiveIssueTemplates(w http.ResponseWriter, r *http.Request) {
+	connector, ok := h.loadWorkbenchConnector(w, r, false)
+	if !ok {
+		return
+	}
+	rows, err := h.Queries.ListActiveIssueTemplates(r.Context(), db.ListActiveIssueTemplatesParams{WorkspaceID: connector.WorkspaceID, ConnectorID: connector.ID})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list active issue templates")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"issue_templates": issueTemplateResponses(rows)})
+}
+
+func (h *Handler) PreviewConnectorRouting(w http.ResponseWriter, r *http.Request) {
+	var req RoutingPreviewRequest
+	if !decodeWorkbenchJSON(w, r, &req) {
+		return
+	}
+	if err := validateRequiredWorkbenchText(map[string]string{"source_type": req.SourceType, "title": req.Title}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	for field, value := range map[string]*string{"source_status": req.SourceStatus, "summary": req.Summary} {
+		if value != nil && len(*value) > maxWorkbenchTextLength {
+			writeError(w, http.StatusBadRequest, field+" exceeds the maximum length")
+			return
+		}
+	}
+	labels, err := normalizeLabels(req.Labels)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "labels "+err.Error())
+		return
+	}
+	if err := validateScalarObject(req.Fields); err != nil {
+		writeError(w, http.StatusBadRequest, "fields "+err.Error())
+		return
+	}
+	connectorID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "connectorId"), "connector id")
+	if !ok {
+		return
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	if !ok {
+		return
+	}
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start routing preview")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+	connector, err := qtx.LockEnabledConnectorForPreview(r.Context(), db.LockEnabledConnectorForPreviewParams{ID: connectorID, WorkspaceID: workspaceID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "connector not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load connector")
+		return
+	}
+	if connector.ConnectorType != strings.TrimSpace(req.SourceType) {
+		writeError(w, http.StatusBadRequest, "source_type does not match connector type")
+		return
+	}
+	fields, _ := json.Marshal(defaultObject(req.Fields))
+	template, err := qtx.SelectMatchingIssueTemplate(r.Context(), db.SelectMatchingIssueTemplateParams{WorkspaceID: connector.WorkspaceID, ConnectorID: connector.ID, SourceStatus: optionalText(req.SourceStatus), Labels: labels, Fields: fields})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusUnprocessableEntity, "no enabled issue template matched")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to select issue template")
+		return
+	}
+	if code, msg := h.validatePersistentTemplateAssignee(r.Context(), uuidToString(connector.WorkspaceID), template.AssigneeType, template.AssigneeID); code != 0 {
+		writeError(w, code, msg)
+		return
+	}
+	renderedTitle := template.TitlePrefix + strings.TrimSpace(req.Title)
+	if len(renderedTitle) > maxWorkbenchTextLength {
+		writeError(w, http.StatusBadRequest, "rendered title exceeds the maximum length")
+		return
+	}
+	status := template.Status
+	if !template.AutoStart {
+		status = "backlog"
+	}
+	var description *string
+	switch template.DescriptionSource {
+	case "summary":
+		description = normalizedOptionalString(req.Summary)
+	case "title":
+		value := strings.TrimSpace(req.Title)
+		description = &value
+	}
+	writeJSON(w, http.StatusOK, RoutingPreviewResponse{
+		Connector:     connectorResponseParts(connector.ID, connector.Key, connector.Name, connector.ConnectorType, connector.Capabilities, connector.Enabled, connector.CreatedAt, connector.UpdatedAt),
+		IssueTemplate: issueTemplateResponse(template),
+		Issue:         RoutingPreviewIssueResponse{Title: renderedTitle, Description: description, Status: status, Priority: template.IssuePriority, AssigneeType: textToPtr(template.AssigneeType), AssigneeID: uuidToPtr(template.AssigneeID), AutoStart: template.AutoStart},
+	})
+}
+
+func (h *Handler) loadWorkbenchConnector(w http.ResponseWriter, r *http.Request, enabledOnly bool) (workbenchConnector, bool) {
+	connectorID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "connectorId"), "connector id")
+	if !ok {
+		return workbenchConnector{}, false
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	if !ok {
+		return workbenchConnector{}, false
+	}
+	var connector workbenchConnector
+	var err error
+	if enabledOnly {
+		row, queryErr := h.Queries.GetEnabledConnectorInWorkspace(r.Context(), db.GetEnabledConnectorInWorkspaceParams{ID: connectorID, WorkspaceID: workspaceID})
+		err = queryErr
+		connector = workbenchConnector{ID: row.ID, WorkspaceID: row.WorkspaceID, Key: row.Key, Name: row.Name, ConnectorType: row.ConnectorType, Capabilities: row.Capabilities, Enabled: row.Enabled, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	} else {
+		row, queryErr := h.Queries.GetConnectorInWorkspace(r.Context(), db.GetConnectorInWorkspaceParams{ID: connectorID, WorkspaceID: workspaceID})
+		err = queryErr
+		connector = workbenchConnector{ID: row.ID, WorkspaceID: row.WorkspaceID, Key: row.Key, Name: row.Name, ConnectorType: row.ConnectorType, Capabilities: row.Capabilities, Enabled: row.Enabled, CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt}
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "connector not found")
+		return workbenchConnector{}, false
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load connector")
+		return workbenchConnector{}, false
+	}
+	return connector, true
+}
+
+func connectorResponseParts(id pgtype.UUID, key, name, connectorType string, rawCapabilities []byte, enabled bool, createdAt, updatedAt pgtype.Timestamptz) ConnectorResponse {
+	capabilities := map[string]any{}
+	_ = json.Unmarshal(rawCapabilities, &capabilities)
+	return ConnectorResponse{ID: uuidToString(id), Key: key, Name: name, ConnectorType: connectorType, Capabilities: capabilities, Enabled: enabled, CreatedAt: timestampToString(createdAt), UpdatedAt: timestampToString(updatedAt)}
+}
+
+func issueTemplateResponses(rows []db.IssueTemplate) []IssueTemplateResponse {
+	response := make([]IssueTemplateResponse, len(rows))
+	for i := range rows {
+		response[i] = issueTemplateResponse(rows[i])
+	}
+	return response
+}
+
+func issueTemplateResponse(row db.IssueTemplate) IssueTemplateResponse {
+	fields := map[string]any{}
+	_ = json.Unmarshal(row.MatchFields, &fields)
+	labels := row.MatchLabelsAny
+	if labels == nil {
+		labels = []string{}
+	}
+	return IssueTemplateResponse{ID: uuidToString(row.ID), ConnectorID: uuidToString(row.ConnectorID), TemplateKey: row.TemplateKey, Version: row.Version, Name: row.Name, Enabled: row.Enabled, Priority: row.Priority, MatchSourceStatus: textToPtr(row.MatchSourceStatus), MatchLabelsAny: labels, MatchFields: fields, TitlePrefix: row.TitlePrefix, DescriptionSource: row.DescriptionSource, Status: row.Status, IssuePriority: row.IssuePriority, AssigneeType: textToPtr(row.AssigneeType), AssigneeID: uuidToPtr(row.AssigneeID), AutoStart: row.AutoStart, CreatedAt: timestampToString(row.CreatedAt)}
+}
+
+func (h *Handler) CreateConnectorCredential(w http.ResponseWriter, r *http.Request) {
+	var req CreateConnectorCredentialRequest
+	if !decodeWorkbenchJSON(w, r, &req) {
+		return
+	}
+	if err := validateRequiredWorkbenchText(map[string]string{"name": req.Name}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	connectorID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "connectorId"), "connector id")
+	if !ok {
+		return
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	if !ok {
+		return
+	}
+	if _, err := h.Queries.GetConnectorInWorkspace(r.Context(), db.GetConnectorInWorkspaceParams{ID: connectorID, WorkspaceID: workspaceID}); errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "connector not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load connector")
+		return
+	}
+	member, ok := h.requireWorkspaceRole(w, r, uuidToString(workspaceID), "connector not found", "owner", "admin")
+	if !ok {
+		return
+	}
+	creator := uuidToString(member.UserID)
+	raw, err := auth.GenerateConnectorToken()
+	if err != nil {
+		writeError(w, 500, "failed to generate credential")
+		return
+	}
+	row, err := h.Queries.CreateConnectorCredential(r.Context(), db.CreateConnectorCredentialParams{ConnectorID: connectorID, WorkspaceID: workspaceID, Name: strings.TrimSpace(req.Name), TokenHash: auth.HashToken(raw), TokenPrefix: raw[:12], CreatedBy: parseUUID(creator)})
+	if err != nil {
+		writeError(w, 500, "failed to create credential")
+		return
+	}
+	response := connectorCredentialResponse(row.ID, row.ConnectorID, row.Name, row.TokenPrefix, row.RevokedAt, row.LastUsedAt, row.CreatedAt)
+	response.Token = raw
+	writeJSON(w, http.StatusCreated, response)
+}
+
+func (h *Handler) ListConnectorCredentials(w http.ResponseWriter, r *http.Request) {
+	connectorID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "connectorId"), "connector id")
+	if !ok {
+		return
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	if !ok {
+		return
+	}
+	if _, err := h.Queries.GetConnectorInWorkspace(r.Context(), db.GetConnectorInWorkspaceParams{ID: connectorID, WorkspaceID: workspaceID}); errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "connector not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load connector")
+		return
+	}
+	if _, ok := h.requireWorkspaceRole(w, r, uuidToString(workspaceID), "connector not found", "owner", "admin"); !ok {
+		return
+	}
+	rows, err := h.Queries.ListConnectorCredentials(r.Context(), db.ListConnectorCredentialsParams{WorkspaceID: workspaceID, ConnectorID: connectorID})
+	if err != nil {
+		writeError(w, 500, "failed to list credentials")
+		return
+	}
+	response := make([]ConnectorCredentialResponse, len(rows))
+	for i := range rows {
+		response[i] = connectorCredentialResponse(rows[i].ID, rows[i].ConnectorID, rows[i].Name, rows[i].TokenPrefix, rows[i].RevokedAt, rows[i].LastUsedAt, rows[i].CreatedAt)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"credentials": response})
+}
+
+func (h *Handler) RevokeConnectorCredential(w http.ResponseWriter, r *http.Request) {
+	connectorID, credentialID, workspaceID, ok := h.connectorCredentialPath(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := h.requireWorkspaceRole(w, r, uuidToString(workspaceID), "credential not found", "owner", "admin"); !ok {
+		return
+	}
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, "failed to start transaction")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+	if _, err := qtx.LockConnectorForCredentialManagement(r.Context(), db.LockConnectorForCredentialManagementParams{ID: connectorID, WorkspaceID: workspaceID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "credential not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to revoke credential")
+		}
+		return
+	}
+	if _, err := qtx.GetActiveConnectorCredentialForUpdate(r.Context(), db.GetActiveConnectorCredentialForUpdateParams{ID: credentialID, ConnectorID: connectorID, WorkspaceID: workspaceID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "credential not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to revoke credential")
+		}
+		return
+	}
+	if affected, err := qtx.RevokeConnectorCredential(r.Context(), db.RevokeConnectorCredentialParams{ID: credentialID, ConnectorID: connectorID, WorkspaceID: workspaceID}); err != nil || affected != 1 {
+		writeError(w, 500, "failed to revoke credential")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, "failed to revoke credential")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) RotateConnectorCredential(w http.ResponseWriter, r *http.Request) {
+	connectorID, credentialID, workspaceID, ok := h.connectorCredentialPath(w, r)
+	if !ok {
+		return
+	}
+	member, ok := h.requireWorkspaceRole(w, r, uuidToString(workspaceID), "credential not found", "owner", "admin")
+	if !ok {
+		return
+	}
+	creator := uuidToString(member.UserID)
+	raw, err := auth.GenerateConnectorToken()
+	if err != nil {
+		writeError(w, 500, "failed to generate credential")
+		return
+	}
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, "failed to start transaction")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+	if _, err := qtx.LockConnectorForCredentialManagement(r.Context(), db.LockConnectorForCredentialManagementParams{ID: connectorID, WorkspaceID: workspaceID}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "credential not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to rotate credential")
+		}
+		return
+	}
+	old, err := qtx.GetActiveConnectorCredentialForUpdate(r.Context(), db.GetActiveConnectorCredentialForUpdateParams{ID: credentialID, ConnectorID: connectorID, WorkspaceID: workspaceID})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "credential not found")
+		} else {
+			writeError(w, http.StatusInternalServerError, "failed to rotate credential")
+		}
+		return
+	}
+	if affected, err := qtx.RevokeConnectorCredential(r.Context(), db.RevokeConnectorCredentialParams{ID: credentialID, ConnectorID: connectorID, WorkspaceID: workspaceID}); err != nil || affected != 1 {
+		writeError(w, 500, "failed to rotate credential")
+		return
+	}
+	row, err := qtx.CreateConnectorCredential(r.Context(), db.CreateConnectorCredentialParams{ConnectorID: connectorID, WorkspaceID: workspaceID, Name: old.Name, TokenHash: auth.HashToken(raw), TokenPrefix: raw[:12], CreatedBy: parseUUID(creator)})
+	if err != nil {
+		writeError(w, 500, "failed to rotate credential")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, "failed to rotate credential")
+		return
+	}
+	response := connectorCredentialResponse(row.ID, row.ConnectorID, row.Name, row.TokenPrefix, row.RevokedAt, row.LastUsedAt, row.CreatedAt)
+	response.Token = raw
+	writeJSON(w, http.StatusCreated, response)
+}
+
+func (h *Handler) connectorCredentialPath(w http.ResponseWriter, r *http.Request) (pgtype.UUID, pgtype.UUID, pgtype.UUID, bool) {
+	connectorID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "connectorId"), "connector id")
+	if !ok {
+		return pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, false
+	}
+	credentialID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "credentialId"), "credential id")
+	if !ok {
+		return pgtype.UUID{}, pgtype.UUID{}, pgtype.UUID{}, false
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	return connectorID, credentialID, workspaceID, ok
+}
+
+func connectorCredentialResponse(id, connectorID pgtype.UUID, name, tokenPrefix string, revokedAt, lastUsedAt, createdAt pgtype.Timestamptz) ConnectorCredentialResponse {
+	return ConnectorCredentialResponse{ID: uuidToString(id), ConnectorID: uuidToString(connectorID), Name: name, TokenPrefix: tokenPrefix, RevokedAt: timestampToPtr(revokedAt), LastUsedAt: timestampToPtr(lastUsedAt), CreatedAt: timestampToString(createdAt)}
 }
 
 func (h *Handler) CreateIssueTemplate(w http.ResponseWriter, r *http.Request) {
@@ -168,11 +664,26 @@ func (h *Handler) CreateIssueTemplate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, err.Error())
 		return
 	}
+	if err := validateOptionalWorkbenchText(map[string]*string{
+		"match.source_status":  req.Match.SourceStatus,
+		"output.assignee_type": req.Output.AssigneeType,
+	}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(req.Output.TitlePrefix) > maxWorkbenchTextLength {
+		writeError(w, http.StatusBadRequest, "output.title_prefix exceeds the maximum length")
+		return
+	}
 	connectorID, ok := parseUUIDOrBadRequest(w, req.ConnectorID, "connector_id")
 	if !ok {
 		return
 	}
 	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	if !ok {
+		return
+	}
+	member, ok := h.requireWorkspaceRole(w, r, uuidToString(workspaceID), "connector not found", "owner", "admin")
 	if !ok {
 		return
 	}
@@ -233,10 +744,7 @@ func (h *Handler) CreateIssueTemplate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, code, msg)
 		return
 	}
-	creator, ok := requireUserID(w, r)
-	if !ok {
-		return
-	}
+	creator := uuidToString(member.UserID)
 	tx, err := h.TxStarter.Begin(r.Context())
 	if err != nil {
 		writeError(w, 500, "failed to start transaction")
@@ -280,9 +788,25 @@ func (h *Handler) CreateIssueTemplate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
+	h.ingestExternalRecord(w, r, false)
+}
+
+func (h *Handler) ConnectorIngestExternalRecord(w http.ResponseWriter, r *http.Request) {
+	h.ingestExternalRecord(w, r, true)
+}
+
+func (h *Handler) ingestExternalRecord(w http.ResponseWriter, r *http.Request, machine bool) {
 	var req IngestExternalRecordRequest
 	if !decodeWorkbenchJSON(w, r, &req) {
 		return
+	}
+	if machine {
+		if req.ConnectorID != nil || req.IssueID != nil || req.CreateIssue != nil {
+			writeError(w, http.StatusBadRequest, "connector_id, issue_id, and create_issue are not allowed")
+			return
+		}
+		connectorID := r.Header.Get("X-Connector-ID")
+		req.ConnectorID = &connectorID
 	}
 	if err := validateIngestExternalRecordRequest(req); err != nil {
 		writeError(w, 400, err.Error())
@@ -332,8 +856,12 @@ func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "failed to select issue template")
 			return
 		}
-		if code, msg := h.validateAssigneePair(r.Context(), r, h.resolveWorkspaceID(r), validatedTemplate.AssigneeType, validatedTemplate.AssigneeID); code != 0 {
+		if code, msg := h.validatePersistentTemplateAssignee(r.Context(), h.resolveWorkspaceID(r), validatedTemplate.AssigneeType, validatedTemplate.AssigneeID); code != 0 {
 			writeError(w, code, msg)
+			return
+		}
+		if len(validatedTemplate.TitlePrefix+strings.TrimSpace(req.Title)) > maxWorkbenchTextLength {
+			writeError(w, http.StatusBadRequest, "rendered title exceeds the maximum length")
 			return
 		}
 	}
@@ -345,8 +873,17 @@ func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
 		}
 		issueID = issue.ID
 	}
-	creatorID, ok := requireUserID(w, r)
-	if !ok {
+	creatorID := requestUserID(r)
+	credentialID := pgtype.UUID{}
+	if machine {
+		creatorID = workbenchSystemActorID
+		credentialID, ok = parseUUIDOrBadRequest(w, middleware.ConnectorCredentialIDFromContext(r.Context()), "connector credential id")
+		if !ok {
+			return
+		}
+	}
+	if creatorID == "" {
+		writeError(w, http.StatusUnauthorized, "actor not authenticated")
 		return
 	}
 	var createParams service.IssueCreateParams
@@ -381,6 +918,21 @@ func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
 		}
 		if connector.ConnectorType != strings.TrimSpace(req.SourceType) {
 			writeError(w, http.StatusConflict, "connector changed during ingest")
+			return
+		}
+		if machine {
+			if _, err := qtx.GetActiveConnectorCredentialForUpdate(r.Context(), db.GetActiveConnectorCredentialForUpdateParams{ID: credentialID, ConnectorID: connectorID, WorkspaceID: workspaceID}); errors.Is(err, pgx.ErrNoRows) {
+				writeError(w, http.StatusUnauthorized, "invalid connector credential")
+				return
+			} else if err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to revalidate connector credential")
+				return
+			}
+		}
+	}
+	if machine {
+		if err := qtx.UpdateConnectorCredentialLastUsed(r.Context(), db.UpdateConnectorCredentialLastUsedParams{ID: credentialID, ConnectorID: connectorID, WorkspaceID: workspaceID}); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to update connector credential usage")
 			return
 		}
 	}
@@ -428,8 +980,16 @@ func (h *Handler) IngestExternalRecord(w http.ResponseWriter, r *http.Request) {
 		case "title":
 			description = pgtype.Text{String: strings.TrimSpace(req.Title), Valid: true}
 		}
-		createParams = service.IssueCreateParams{WorkspaceID: workspaceID, Title: template.TitlePrefix + strings.TrimSpace(req.Title), Description: description, Status: status, Priority: template.IssuePriority, AssigneeType: template.AssigneeType, AssigneeID: template.AssigneeID, CreatorType: "member", CreatorID: parseUUID(creatorID), AllowDuplicate: true}
-		createOpts = service.IssueCreateOpts{ActorID: creatorID, AnalyticsAgentID: templateAnalyticsAgent(template)}
+		creatorType := "member"
+		actorID := creatorID
+		if machine {
+			// The issue schema only accepts member/agent creators. A nil-FK neutral
+			// member UUID avoids impersonating the credential's created_by user.
+			creatorType = "member"
+			actorID = ""
+		}
+		createParams = service.IssueCreateParams{WorkspaceID: workspaceID, Title: template.TitlePrefix + strings.TrimSpace(req.Title), Description: description, Status: status, Priority: template.IssuePriority, AssigneeType: template.AssigneeType, AssigneeID: template.AssigneeID, CreatorType: creatorType, CreatorID: parseUUID(creatorID), AllowDuplicate: true}
+		createOpts = service.IssueCreateOpts{ActorID: actorID, SuppressActorFallback: machine, AnalyticsAgentID: templateAnalyticsAgent(template)}
 	}
 	record, err := qtx.UpsertExternalRecord(r.Context(), db.UpsertExternalRecordParams{WorkspaceID: workspaceID, SourceType: strings.TrimSpace(req.SourceType), ExternalID: strings.TrimSpace(req.ExternalID), Title: strings.TrimSpace(req.Title), SchemaVersion: ingestSchemaVersion(req.SchemaVersion), Labels: labels, Fields: fieldsJSON, ConnectorID: connectorID, ExternalKey: optionalText(req.ExternalKey), Summary: optionalText(req.Summary), SourceStatus: optionalText(req.SourceStatus), SourceUrl: optionalText(req.SourceURL), LastSeenAt: timestamptz(observedAt)})
 	if err != nil {
@@ -559,8 +1119,7 @@ func decodeWorkbenchJSON(w http.ResponseWriter, r *http.Request, target any) boo
 		writeError(w, 400, "invalid request body")
 		return false
 	}
-	var extra any
-	if decoder.Decode(&extra) == nil {
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		writeError(w, 400, "invalid request body")
 		return false
 	}
@@ -577,6 +1136,78 @@ func validateRequiredWorkbenchText(values map[string]string) error {
 	}
 	return nil
 }
+func validateOptionalWorkbenchText(values map[string]*string) error {
+	for field, value := range values {
+		if value != nil && len(*value) > maxWorkbenchTextLength {
+			return errors.New(field + " exceeds the maximum length")
+		}
+	}
+	return nil
+}
+
+func (h *Handler) validatePersistentTemplateAssignee(ctx context.Context, workspaceID string, assigneeType pgtype.Text, assigneeID pgtype.UUID) (int, string) {
+	if !assigneeType.Valid && !assigneeID.Valid {
+		return 0, ""
+	}
+	if assigneeType.Valid != assigneeID.Valid {
+		return http.StatusBadRequest, "assignee_type and assignee_id must be provided together"
+	}
+	wsUUID, err := parseUUIDString(workspaceID)
+	if err != nil {
+		return http.StatusBadRequest, "invalid workspace_id"
+	}
+	switch assigneeType.String {
+	case "member":
+		if _, err := h.Queries.GetMemberByUserAndWorkspace(ctx, db.GetMemberByUserAndWorkspaceParams{UserID: assigneeID, WorkspaceID: wsUUID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return http.StatusBadRequest, "assignee_id does not refer to a member of this workspace"
+			}
+			return http.StatusInternalServerError, "failed to validate template assignee"
+		}
+	case "agent":
+		agent, err := h.Queries.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: assigneeID, WorkspaceID: wsUUID})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return http.StatusBadRequest, "assignee_id does not refer to an agent of this workspace"
+			}
+			return http.StatusInternalServerError, "failed to validate template assignee"
+		}
+		if agent.ArchivedAt.Valid || !agent.RuntimeID.Valid {
+			return http.StatusBadRequest, "cannot route to unavailable agent"
+		}
+	case "squad":
+		squad, err := h.Queries.GetSquadInWorkspace(ctx, db.GetSquadInWorkspaceParams{ID: assigneeID, WorkspaceID: wsUUID})
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return http.StatusBadRequest, "assignee_id does not refer to an active squad in this workspace"
+			}
+			return http.StatusInternalServerError, "failed to validate template assignee"
+		}
+		if squad.ArchivedAt.Valid {
+			return http.StatusBadRequest, "assignee_id does not refer to an active squad in this workspace"
+		}
+		leader, err := h.Queries.GetAgent(ctx, squad.LeaderID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return http.StatusBadRequest, "squad leader is unavailable; cannot route to this squad"
+			}
+			return http.StatusInternalServerError, "failed to validate template assignee"
+		}
+		if leader.ArchivedAt.Valid || !leader.RuntimeID.Valid {
+			return http.StatusBadRequest, "squad leader is unavailable; cannot route to this squad"
+		}
+	default:
+		return http.StatusBadRequest, "assignee_type must be 'member', 'agent', or 'squad'"
+	}
+	return 0, ""
+}
+
+func parseUUIDString(value string) (pgtype.UUID, error) {
+	var id pgtype.UUID
+	err := id.Scan(value)
+	return id, err
+}
+
 func validateIngestExternalRecordRequest(req IngestExternalRecordRequest) error {
 	if req.ConnectorID != nil && (req.IssueID != nil || req.CreateIssue != nil) {
 		return errors.New("connector_id cannot be combined with issue_id or create_issue")

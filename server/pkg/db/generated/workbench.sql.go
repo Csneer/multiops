@@ -69,6 +69,64 @@ func (q *Queries) CompleteIntegrationIngestAttempt(ctx context.Context, arg Comp
 	return i, err
 }
 
+const createConnectorCredential = `-- name: CreateConnectorCredential :one
+INSERT INTO connector_credential (
+    connector_id, workspace_id, name, token_hash, token_prefix, created_by
+)
+SELECT ci.id, ci.workspace_id, $1, $2,
+       $3, $4
+FROM connector_instance ci
+WHERE ci.id = $5
+  AND ci.workspace_id = $6
+RETURNING id, connector_id, workspace_id, name, token_prefix, revoked_at,
+          created_by, last_used_at, created_at
+`
+
+type CreateConnectorCredentialParams struct {
+	Name        string      `json:"name"`
+	TokenHash   string      `json:"token_hash"`
+	TokenPrefix string      `json:"token_prefix"`
+	CreatedBy   pgtype.UUID `json:"created_by"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type CreateConnectorCredentialRow struct {
+	ID          pgtype.UUID        `json:"id"`
+	ConnectorID pgtype.UUID        `json:"connector_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Name        string             `json:"name"`
+	TokenPrefix string             `json:"token_prefix"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+	CreatedBy   pgtype.UUID        `json:"created_by"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) CreateConnectorCredential(ctx context.Context, arg CreateConnectorCredentialParams) (CreateConnectorCredentialRow, error) {
+	row := q.db.QueryRow(ctx, createConnectorCredential,
+		arg.Name,
+		arg.TokenHash,
+		arg.TokenPrefix,
+		arg.CreatedBy,
+		arg.ConnectorID,
+		arg.WorkspaceID,
+	)
+	var i CreateConnectorCredentialRow
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectorID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.TokenPrefix,
+		&i.RevokedAt,
+		&i.CreatedBy,
+		&i.LastUsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const createConnectorInstance = `-- name: CreateConnectorInstance :one
 
 INSERT INTO connector_instance (
@@ -243,6 +301,47 @@ func (q *Queries) CreateIssueTemplate(ctx context.Context, arg CreateIssueTempla
 	return i, err
 }
 
+const disableConnectorInWorkspace = `-- name: DisableConnectorInWorkspace :one
+UPDATE connector_instance
+SET enabled = false, updated_at = now()
+WHERE id = $1 AND workspace_id = $2
+RETURNING id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+`
+
+type DisableConnectorInWorkspaceParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type DisableConnectorInWorkspaceRow struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Key           string             `json:"key"`
+	Name          string             `json:"name"`
+	ConnectorType string             `json:"connector_type"`
+	Capabilities  []byte             `json:"capabilities"`
+	Enabled       bool               `json:"enabled"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+func (q *Queries) DisableConnectorInWorkspace(ctx context.Context, arg DisableConnectorInWorkspaceParams) (DisableConnectorInWorkspaceRow, error) {
+	row := q.db.QueryRow(ctx, disableConnectorInWorkspace, arg.ID, arg.WorkspaceID)
+	var i DisableConnectorInWorkspaceRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Key,
+		&i.Name,
+		&i.ConnectorType,
+		&i.Capabilities,
+		&i.Enabled,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const disableEnabledIssueTemplate = `-- name: DisableEnabledIssueTemplate :exec
 UPDATE issue_template SET enabled = false
 WHERE workspace_id = $1 AND connector_id = $2 AND template_key = $3 AND enabled
@@ -259,8 +358,122 @@ func (q *Queries) DisableEnabledIssueTemplate(ctx context.Context, arg DisableEn
 	return err
 }
 
+const getActiveConnectorCredentialByHash = `-- name: GetActiveConnectorCredentialByHash :one
+SELECT cc.id, cc.connector_id, cc.workspace_id, ci.connector_type
+FROM connector_credential cc
+JOIN connector_instance ci
+  ON ci.id = cc.connector_id
+ AND ci.workspace_id = cc.workspace_id
+WHERE cc.token_hash = $1
+  AND cc.revoked_at IS NULL
+  AND ci.enabled
+`
+
+type GetActiveConnectorCredentialByHashRow struct {
+	ID            pgtype.UUID `json:"id"`
+	ConnectorID   pgtype.UUID `json:"connector_id"`
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
+	ConnectorType string      `json:"connector_type"`
+}
+
+func (q *Queries) GetActiveConnectorCredentialByHash(ctx context.Context, tokenHash string) (GetActiveConnectorCredentialByHashRow, error) {
+	row := q.db.QueryRow(ctx, getActiveConnectorCredentialByHash, tokenHash)
+	var i GetActiveConnectorCredentialByHashRow
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectorID,
+		&i.WorkspaceID,
+		&i.ConnectorType,
+	)
+	return i, err
+}
+
+const getActiveConnectorCredentialForUpdate = `-- name: GetActiveConnectorCredentialForUpdate :one
+SELECT id, connector_id, workspace_id, name, token_prefix, revoked_at,
+       created_by, last_used_at, created_at
+FROM connector_credential
+WHERE id = $1 AND connector_id = $2 AND workspace_id = $3 AND revoked_at IS NULL
+FOR UPDATE
+`
+
+type GetActiveConnectorCredentialForUpdateParams struct {
+	ID          pgtype.UUID `json:"id"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type GetActiveConnectorCredentialForUpdateRow struct {
+	ID          pgtype.UUID        `json:"id"`
+	ConnectorID pgtype.UUID        `json:"connector_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Name        string             `json:"name"`
+	TokenPrefix string             `json:"token_prefix"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+	CreatedBy   pgtype.UUID        `json:"created_by"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) GetActiveConnectorCredentialForUpdate(ctx context.Context, arg GetActiveConnectorCredentialForUpdateParams) (GetActiveConnectorCredentialForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, getActiveConnectorCredentialForUpdate, arg.ID, arg.ConnectorID, arg.WorkspaceID)
+	var i GetActiveConnectorCredentialForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.ConnectorID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.TokenPrefix,
+		&i.RevokedAt,
+		&i.CreatedBy,
+		&i.LastUsedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getConnectorInWorkspace = `-- name: GetConnectorInWorkspace :one
+SELECT id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+FROM connector_instance
+WHERE id = $1 AND workspace_id = $2
+`
+
+type GetConnectorInWorkspaceParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type GetConnectorInWorkspaceRow struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Key           string             `json:"key"`
+	Name          string             `json:"name"`
+	ConnectorType string             `json:"connector_type"`
+	Capabilities  []byte             `json:"capabilities"`
+	Enabled       bool               `json:"enabled"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+func (q *Queries) GetConnectorInWorkspace(ctx context.Context, arg GetConnectorInWorkspaceParams) (GetConnectorInWorkspaceRow, error) {
+	row := q.db.QueryRow(ctx, getConnectorInWorkspace, arg.ID, arg.WorkspaceID)
+	var i GetConnectorInWorkspaceRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Key,
+		&i.Name,
+		&i.ConnectorType,
+		&i.Capabilities,
+		&i.Enabled,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getEnabledConnectorInWorkspace = `-- name: GetEnabledConnectorInWorkspace :one
-SELECT id, workspace_id, key, name, connector_type, capabilities, config, enabled, created_by, created_at, updated_at FROM connector_instance
+SELECT id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+FROM connector_instance
 WHERE id = $1 AND workspace_id = $2 AND enabled
 `
 
@@ -269,9 +482,21 @@ type GetEnabledConnectorInWorkspaceParams struct {
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
 }
 
-func (q *Queries) GetEnabledConnectorInWorkspace(ctx context.Context, arg GetEnabledConnectorInWorkspaceParams) (ConnectorInstance, error) {
+type GetEnabledConnectorInWorkspaceRow struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Key           string             `json:"key"`
+	Name          string             `json:"name"`
+	ConnectorType string             `json:"connector_type"`
+	Capabilities  []byte             `json:"capabilities"`
+	Enabled       bool               `json:"enabled"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+func (q *Queries) GetEnabledConnectorInWorkspace(ctx context.Context, arg GetEnabledConnectorInWorkspaceParams) (GetEnabledConnectorInWorkspaceRow, error) {
 	row := q.db.QueryRow(ctx, getEnabledConnectorInWorkspace, arg.ID, arg.WorkspaceID)
-	var i ConnectorInstance
+	var i GetEnabledConnectorInWorkspaceRow
 	err := row.Scan(
 		&i.ID,
 		&i.WorkspaceID,
@@ -279,9 +504,7 @@ func (q *Queries) GetEnabledConnectorInWorkspace(ctx context.Context, arg GetEna
 		&i.Name,
 		&i.ConnectorType,
 		&i.Capabilities,
-		&i.Config,
 		&i.Enabled,
-		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
@@ -393,6 +616,162 @@ func (q *Queries) HasAnyTaskHistoryForIssue(ctx context.Context, issueID pgtype.
 	return exists, err
 }
 
+const listActiveIssueTemplates = `-- name: ListActiveIssueTemplates :many
+SELECT id, workspace_id, connector_id, template_key, version, name, enabled, priority, match_source_status, match_labels_any, match_fields, title_prefix, description_source, status, issue_priority, assignee_type, assignee_id, auto_start, created_by, created_at FROM issue_template
+WHERE workspace_id = $1 AND connector_id = $2 AND enabled
+ORDER BY template_key ASC, id ASC
+`
+
+type ListActiveIssueTemplatesParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+}
+
+func (q *Queries) ListActiveIssueTemplates(ctx context.Context, arg ListActiveIssueTemplatesParams) ([]IssueTemplate, error) {
+	rows, err := q.db.Query(ctx, listActiveIssueTemplates, arg.WorkspaceID, arg.ConnectorID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []IssueTemplate{}
+	for rows.Next() {
+		var i IssueTemplate
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.ConnectorID,
+			&i.TemplateKey,
+			&i.Version,
+			&i.Name,
+			&i.Enabled,
+			&i.Priority,
+			&i.MatchSourceStatus,
+			&i.MatchLabelsAny,
+			&i.MatchFields,
+			&i.TitlePrefix,
+			&i.DescriptionSource,
+			&i.Status,
+			&i.IssuePriority,
+			&i.AssigneeType,
+			&i.AssigneeID,
+			&i.AutoStart,
+			&i.CreatedBy,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listConnectorCredentials = `-- name: ListConnectorCredentials :many
+SELECT id, connector_id, workspace_id, name, token_prefix, revoked_at,
+       created_by, last_used_at, created_at
+FROM connector_credential
+WHERE workspace_id = $1 AND connector_id = $2
+ORDER BY created_at DESC, id ASC
+`
+
+type ListConnectorCredentialsParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+}
+
+type ListConnectorCredentialsRow struct {
+	ID          pgtype.UUID        `json:"id"`
+	ConnectorID pgtype.UUID        `json:"connector_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Name        string             `json:"name"`
+	TokenPrefix string             `json:"token_prefix"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+	CreatedBy   pgtype.UUID        `json:"created_by"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListConnectorCredentials(ctx context.Context, arg ListConnectorCredentialsParams) ([]ListConnectorCredentialsRow, error) {
+	rows, err := q.db.Query(ctx, listConnectorCredentials, arg.WorkspaceID, arg.ConnectorID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListConnectorCredentialsRow{}
+	for rows.Next() {
+		var i ListConnectorCredentialsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.ConnectorID,
+			&i.WorkspaceID,
+			&i.Name,
+			&i.TokenPrefix,
+			&i.RevokedAt,
+			&i.CreatedBy,
+			&i.LastUsedAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listConnectorsInWorkspace = `-- name: ListConnectorsInWorkspace :many
+SELECT id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+FROM connector_instance
+WHERE workspace_id = $1
+ORDER BY key ASC, id ASC
+`
+
+type ListConnectorsInWorkspaceRow struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Key           string             `json:"key"`
+	Name          string             `json:"name"`
+	ConnectorType string             `json:"connector_type"`
+	Capabilities  []byte             `json:"capabilities"`
+	Enabled       bool               `json:"enabled"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+func (q *Queries) ListConnectorsInWorkspace(ctx context.Context, workspaceID pgtype.UUID) ([]ListConnectorsInWorkspaceRow, error) {
+	rows, err := q.db.Query(ctx, listConnectorsInWorkspace, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListConnectorsInWorkspaceRow{}
+	for rows.Next() {
+		var i ListConnectorsInWorkspaceRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.Key,
+			&i.Name,
+			&i.ConnectorType,
+			&i.Capabilities,
+			&i.Enabled,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listIssueExternalRecordBindings = `-- name: ListIssueExternalRecordBindings :many
 SELECT
     b.id AS binding_id,
@@ -479,6 +858,76 @@ func (q *Queries) ListIssueExternalRecordBindings(ctx context.Context, arg ListI
 	return items, nil
 }
 
+const listIssueTemplateHistory = `-- name: ListIssueTemplateHistory :many
+SELECT id, workspace_id, connector_id, template_key, version, name, enabled, priority, match_source_status, match_labels_any, match_fields, title_prefix, description_source, status, issue_priority, assignee_type, assignee_id, auto_start, created_by, created_at FROM issue_template
+WHERE workspace_id = $1 AND connector_id = $2
+ORDER BY template_key ASC, version DESC, id ASC
+`
+
+type ListIssueTemplateHistoryParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+}
+
+func (q *Queries) ListIssueTemplateHistory(ctx context.Context, arg ListIssueTemplateHistoryParams) ([]IssueTemplate, error) {
+	rows, err := q.db.Query(ctx, listIssueTemplateHistory, arg.WorkspaceID, arg.ConnectorID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []IssueTemplate{}
+	for rows.Next() {
+		var i IssueTemplate
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.ConnectorID,
+			&i.TemplateKey,
+			&i.Version,
+			&i.Name,
+			&i.Enabled,
+			&i.Priority,
+			&i.MatchSourceStatus,
+			&i.MatchLabelsAny,
+			&i.MatchFields,
+			&i.TitlePrefix,
+			&i.DescriptionSource,
+			&i.Status,
+			&i.IssuePriority,
+			&i.AssigneeType,
+			&i.AssigneeID,
+			&i.AutoStart,
+			&i.CreatedBy,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockConnectorForCredentialManagement = `-- name: LockConnectorForCredentialManagement :one
+SELECT id FROM connector_instance
+WHERE id = $1 AND workspace_id = $2
+FOR UPDATE
+`
+
+type LockConnectorForCredentialManagementParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) LockConnectorForCredentialManagement(ctx context.Context, arg LockConnectorForCredentialManagementParams) (pgtype.UUID, error) {
+	row := q.db.QueryRow(ctx, lockConnectorForCredentialManagement, arg.ID, arg.WorkspaceID)
+	var id pgtype.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const lockConnectorTemplateKey = `-- name: LockConnectorTemplateKey :exec
 SELECT pg_advisory_xact_lock(hashtextextended(
     $1::text || ':' || $2::text || ':' || $3, 0
@@ -494,6 +943,47 @@ type LockConnectorTemplateKeyParams struct {
 func (q *Queries) LockConnectorTemplateKey(ctx context.Context, arg LockConnectorTemplateKeyParams) error {
 	_, err := q.db.Exec(ctx, lockConnectorTemplateKey, arg.WorkspaceID, arg.ConnectorID, arg.TemplateKey)
 	return err
+}
+
+const lockEnabledConnectorForPreview = `-- name: LockEnabledConnectorForPreview :one
+SELECT id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+FROM connector_instance
+WHERE id = $1 AND workspace_id = $2 AND enabled
+FOR SHARE
+`
+
+type LockEnabledConnectorForPreviewParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type LockEnabledConnectorForPreviewRow struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Key           string             `json:"key"`
+	Name          string             `json:"name"`
+	ConnectorType string             `json:"connector_type"`
+	Capabilities  []byte             `json:"capabilities"`
+	Enabled       bool               `json:"enabled"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+func (q *Queries) LockEnabledConnectorForPreview(ctx context.Context, arg LockEnabledConnectorForPreviewParams) (LockEnabledConnectorForPreviewRow, error) {
+	row := q.db.QueryRow(ctx, lockEnabledConnectorForPreview, arg.ID, arg.WorkspaceID)
+	var i LockEnabledConnectorForPreviewRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Key,
+		&i.Name,
+		&i.ConnectorType,
+		&i.Capabilities,
+		&i.Enabled,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const lockEnabledConnectorForRouting = `-- name: LockEnabledConnectorForRouting :one
@@ -652,6 +1142,26 @@ func (q *Queries) RecordOrBumpIntegrationIngestAttempt(ctx context.Context, arg 
 	return i, err
 }
 
+const revokeConnectorCredential = `-- name: RevokeConnectorCredential :execrows
+UPDATE connector_credential
+SET revoked_at = now()
+WHERE id = $1 AND connector_id = $2 AND workspace_id = $3 AND revoked_at IS NULL
+`
+
+type RevokeConnectorCredentialParams struct {
+	ID          pgtype.UUID `json:"id"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) RevokeConnectorCredential(ctx context.Context, arg RevokeConnectorCredentialParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeConnectorCredential, arg.ID, arg.ConnectorID, arg.WorkspaceID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const selectMatchingIssueTemplate = `-- name: SelectMatchingIssueTemplate :one
 SELECT id, workspace_id, connector_id, template_key, version, name, enabled, priority, match_source_status, match_labels_any, match_fields, title_prefix, description_source, status, issue_priority, assignee_type, assignee_id, auto_start, created_by, created_at FROM issue_template
 WHERE workspace_id = $1
@@ -704,6 +1214,23 @@ func (q *Queries) SelectMatchingIssueTemplate(ctx context.Context, arg SelectMat
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const updateConnectorCredentialLastUsed = `-- name: UpdateConnectorCredentialLastUsed :exec
+UPDATE connector_credential
+SET last_used_at = now()
+WHERE id = $1 AND connector_id = $2 AND workspace_id = $3 AND revoked_at IS NULL
+`
+
+type UpdateConnectorCredentialLastUsedParams struct {
+	ID          pgtype.UUID `json:"id"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) UpdateConnectorCredentialLastUsed(ctx context.Context, arg UpdateConnectorCredentialLastUsedParams) error {
+	_, err := q.db.Exec(ctx, updateConnectorCredentialLastUsed, arg.ID, arg.ConnectorID, arg.WorkspaceID)
+	return err
 }
 
 const upsertExternalRecord = `-- name: UpsertExternalRecord :one

@@ -757,6 +757,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
 	})
 
+	// Connector machine ingress uses dedicated credentials only and remains
+	// outside global user auth and workspace membership middleware.
+	r.With(middleware.ConnectorAuth(queries)).Post("/api/integrations/connector-ingest", h.ConnectorIngestExternalRecord)
+
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))
@@ -1023,7 +1027,23 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			})
 
 			// Workbench connector configuration and integration ingress.
-			r.Post("/api/connectors", h.CreateConnector)
+			r.Route("/api/connectors", func(r chi.Router) {
+				r.Get("/", h.ListConnectors)
+				r.Post("/", h.CreateConnector)
+				r.Route("/{connectorId}", func(r chi.Router) {
+					r.Get("/", h.GetConnector)
+					r.Post("/disable", h.DisableConnector)
+					r.Get("/issue-templates", h.ListConnectorIssueTemplateHistory)
+					r.Get("/issue-templates/active", h.ListConnectorActiveIssueTemplates)
+					r.Post("/routing-preview", h.PreviewConnectorRouting)
+					r.Route("/credentials", func(r chi.Router) {
+						r.Post("/", h.CreateConnectorCredential)
+						r.Get("/", h.ListConnectorCredentials)
+						r.Post("/{credentialId}/rotate", h.RotateConnectorCredential)
+						r.Delete("/{credentialId}", h.RevokeConnectorCredential)
+					})
+				})
+			})
 			r.Post("/api/issue-templates", h.CreateIssueTemplate)
 			r.Post("/api/integrations/ingest", h.IngestExternalRecord)
 

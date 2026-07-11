@@ -89,6 +89,28 @@ func TestBroadcastIssueUpdated_EmitsStatusChange(t *testing.T) {
 // TestBroadcastIssueUpdated_NoStatusChange guards the gate: a same-status
 // broadcast reports status_changed=false so the client skips the status-bucket
 // reconcile for non-status field updates.
+func TestIssueCreatePostCommitSuppressesActorFallback(t *testing.T) {
+	bus := events.New()
+	var got []events.Event
+	bus.SubscribeAll(func(e events.Event) { got = append(got, e) })
+
+	issue := db.Issue{ID: testUUID(1), WorkspaceID: testUUID(2), CreatorID: testUUID(3)}
+	postCommit := &IssueCreatePostCommit{
+		service: &IssueService{Bus: bus},
+		issue:   issue,
+		params:  IssueCreateParams{CreatorType: "member"},
+		opts:    IssueCreateOpts{SuppressActorFallback: true},
+	}
+	postCommit.Run(context.Background())
+
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 published event, got %d", len(got))
+	}
+	if got[0].ActorID != "" {
+		t.Fatalf("expected empty machine actor, got %q", got[0].ActorID)
+	}
+}
+
 func TestBroadcastIssueUpdated_NoStatusChange(t *testing.T) {
 	bus := events.New()
 	var got []events.Event

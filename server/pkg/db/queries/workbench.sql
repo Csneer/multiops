@@ -9,12 +9,87 @@ INSERT INTO connector_instance (
 RETURNING *;
 
 -- name: GetEnabledConnectorInWorkspace :one
-SELECT * FROM connector_instance
+SELECT id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+FROM connector_instance
 WHERE id = $1 AND workspace_id = $2 AND enabled;
+
+-- name: GetConnectorInWorkspace :one
+SELECT id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+FROM connector_instance
+WHERE id = $1 AND workspace_id = $2;
+
+-- name: ListConnectorsInWorkspace :many
+SELECT id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+FROM connector_instance
+WHERE workspace_id = $1
+ORDER BY key ASC, id ASC;
+
+-- name: DisableConnectorInWorkspace :one
+UPDATE connector_instance
+SET enabled = false, updated_at = now()
+WHERE id = $1 AND workspace_id = $2
+RETURNING id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at;
+
+-- name: CreateConnectorCredential :one
+INSERT INTO connector_credential (
+    connector_id, workspace_id, name, token_hash, token_prefix, created_by
+)
+SELECT ci.id, ci.workspace_id, sqlc.arg('name'), sqlc.arg('token_hash'),
+       sqlc.arg('token_prefix'), sqlc.arg('created_by')
+FROM connector_instance ci
+WHERE ci.id = sqlc.arg('connector_id')
+  AND ci.workspace_id = sqlc.arg('workspace_id')
+RETURNING id, connector_id, workspace_id, name, token_prefix, revoked_at,
+          created_by, last_used_at, created_at;
+
+-- name: GetActiveConnectorCredentialByHash :one
+SELECT cc.id, cc.connector_id, cc.workspace_id, ci.connector_type
+FROM connector_credential cc
+JOIN connector_instance ci
+  ON ci.id = cc.connector_id
+ AND ci.workspace_id = cc.workspace_id
+WHERE cc.token_hash = $1
+  AND cc.revoked_at IS NULL
+  AND ci.enabled;
+
+-- name: ListConnectorCredentials :many
+SELECT id, connector_id, workspace_id, name, token_prefix, revoked_at,
+       created_by, last_used_at, created_at
+FROM connector_credential
+WHERE workspace_id = $1 AND connector_id = $2
+ORDER BY created_at DESC, id ASC;
+
+-- name: GetActiveConnectorCredentialForUpdate :one
+SELECT id, connector_id, workspace_id, name, token_prefix, revoked_at,
+       created_by, last_used_at, created_at
+FROM connector_credential
+WHERE id = $1 AND connector_id = $2 AND workspace_id = $3 AND revoked_at IS NULL
+FOR UPDATE;
+
+-- name: RevokeConnectorCredential :execrows
+UPDATE connector_credential
+SET revoked_at = now()
+WHERE id = $1 AND connector_id = $2 AND workspace_id = $3 AND revoked_at IS NULL;
+
+-- name: UpdateConnectorCredentialLastUsed :exec
+UPDATE connector_credential
+SET last_used_at = now()
+WHERE id = $1 AND connector_id = $2 AND workspace_id = $3 AND revoked_at IS NULL;
 
 -- name: LockEnabledConnectorForRouting :one
 SELECT * FROM connector_instance
 WHERE id = $1 AND workspace_id = $2 AND enabled
+FOR UPDATE;
+
+-- name: LockEnabledConnectorForPreview :one
+SELECT id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at
+FROM connector_instance
+WHERE id = $1 AND workspace_id = $2 AND enabled
+FOR SHARE;
+
+-- name: LockConnectorForCredentialManagement :one
+SELECT id FROM connector_instance
+WHERE id = $1 AND workspace_id = $2
 FOR UPDATE;
 
 -- name: LockConnectorTemplateKey :exec
@@ -42,6 +117,16 @@ INSERT INTO issue_template (
     $10, $11, $12, $13, sqlc.narg('assignee_type'), sqlc.narg('assignee_id'), $14, $15
 )
 RETURNING *;
+
+-- name: ListIssueTemplateHistory :many
+SELECT * FROM issue_template
+WHERE workspace_id = $1 AND connector_id = $2
+ORDER BY template_key ASC, version DESC, id ASC;
+
+-- name: ListActiveIssueTemplates :many
+SELECT * FROM issue_template
+WHERE workspace_id = $1 AND connector_id = $2 AND enabled
+ORDER BY template_key ASC, id ASC;
 
 -- name: SelectMatchingIssueTemplate :one
 SELECT * FROM issue_template

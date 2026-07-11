@@ -90,8 +90,12 @@ type IssueCreateOpts struct {
 	// ActorID overrides the actor ID used for broadcast + analytics
 	// when it differs from the creator on the row. Agent-created issues
 	// use the agent UUID here (the creator_id column is the daemon
-	// owner). Empty falls back to CreatorID.
+	// owner). Empty falls back to CreatorID unless SuppressActorFallback is set.
 	ActorID string
+
+	// SuppressActorFallback preserves an intentionally empty ActorID for
+	// machine-created issues that do not have a first-class actor identity.
+	SuppressActorFallback bool
 
 	// AnalyticsAgentID is the agent associated with the issue for
 	// analytics purposes (assignee agent or, for agent-created issues,
@@ -198,7 +202,7 @@ func (p *IssueCreatePostCommit) Run(ctx context.Context) IssueCreateResult {
 		}
 		attachments := p.service.linkAttachments(ctx, p.issue, p.params.AttachmentIDs)
 		actorID := p.opts.ActorID
-		if actorID == "" {
+		if actorID == "" && !p.opts.SuppressActorFallback {
 			actorID = util.UUIDToString(p.issue.CreatorID)
 		}
 		p.service.publishIssueCreated(p.issue, attachments, p.params.CreatorType, actorID, p.opts)

@@ -361,6 +361,19 @@ type CommentReaction struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type ConnectorCredential struct {
+	ID          pgtype.UUID        `json:"id"`
+	ConnectorID pgtype.UUID        `json:"connector_id"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Name        string             `json:"name"`
+	TokenHash   string             `json:"token_hash"`
+	TokenPrefix string             `json:"token_prefix"`
+	RevokedAt   pgtype.Timestamptz `json:"revoked_at"`
+	CreatedBy   pgtype.UUID        `json:"created_by"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
 type ConnectorInstance struct {
 	ID            pgtype.UUID        `json:"id"`
 	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
