@@ -1,6 +1,28 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 Guidance for Claude Code when working in this repository. Keep this file short and authoritative: rules here should be hard to infer from code or easy to get wrong.
+
+This repo already has a strong baseline CLAUDE file. Prefer extending the existing rules over replacing them, and keep additions focused on non-obvious architecture, command entrypoints, and cross-package constraints.
+
+## Big Picture
+
+Multica is an AI-native work management platform where agents are first-class assignees. The end-to-end runtime is:
+
+1. web/desktop UI creates or updates workspace-scoped work
+2. Go backend persists state, serves APIs, and emits realtime updates over WebSocket
+3. local or cloud runtimes execute agent work through the daemon/CLI layer
+4. frontend state refreshes through TanStack Query invalidation/patching, not ad hoc client mirrors
+
+The architectural seam to protect is:
+
+- backend owns canonical server state and event delivery
+- `packages/core` owns headless client logic, API parsing, queries, and shared Zustand stores
+- `packages/views` owns shared business UI for web/desktop
+- platform apps wire routing, runtime environment, and platform-specific UX around shared views
+
+README and CONTRIBUTING are both relevant here: README explains the product/runtime model, while CONTRIBUTING is the source of truth for local environment setup, shared PostgreSQL, and worktree isolation.
 
 ## Conventions
 
@@ -71,30 +93,64 @@ Mobile is independent. It may import types and pure functions from `@multica/cor
 
 ## Commands
 
-Use the repo scripts as the source of truth. Common commands:
+Use repo scripts and the Makefile as the source of truth. Common entrypoints:
 
 ```bash
-make dev              # auto-setup and start the app
-make start            # start backend + frontend
-make stop             # stop app processes for this checkout
-make server           # run Go server only
-make daemon           # run local daemon
-make test             # Go tests
-make sqlc             # regenerate sqlc code after SQL changes
+make dev                 # bootstrap current checkout and start backend + web
+make start               # start backend + web for current checkout
+make stop                # stop backend + web for current checkout
+make check               # typecheck + TS tests + Go tests + Playwright
+make server              # run Go server only
+make daemon              # restart local daemon with stored auth
+make cli ARGS="..."      # run multica CLI from source
+make test                # Go tests with migrations and DB bootstrap
+make migrate-up          # apply DB migrations
+make migrate-down        # roll back DB migrations
+make sqlc                # regenerate sqlc code after SQL changes
 pnpm install
 pnpm dev:web
 pnpm dev:desktop
 pnpm build
 pnpm typecheck
 pnpm lint
-pnpm test             # TS/Vitest tests through Turborepo
+pnpm test                # TS/Vitest tests through Turborepo
 pnpm exec playwright test
-pnpm ui:add badge     # shadcn/Base UI component into packages/ui
+pnpm ui:add badge        # shadcn/Base UI component into packages/ui
 ```
 
-Worktrees share one PostgreSQL container and get isolated DB names/ports via `.env.worktree`. `make dev` auto-detects this. For manual setup use `make worktree-env`, `make setup-worktree`, and `make start-worktree`. `pnpm dev:desktop` additionally self-isolates per worktree (its own renderer port + app name) automatically, independent of `.env.worktree`.
+For main checkout vs worktree development, CONTRIBUTING is authoritative:
+
+- main checkout uses `.env`
+- worktrees use `.env.worktree`
+- do not copy `.env` into a worktree
+- all checkouts share one PostgreSQL container on `localhost:5432`; isolation happens by database name and app ports
+
+Useful worktree commands:
+
+```bash
+make worktree-env
+make setup-worktree
+make start-worktree
+make stop-worktree
+make check-worktree
+```
+
+Useful targeted workflows:
+
+```bash
+pnpm --filter @multica/web dev
+pnpm --filter @multica/desktop dev
+pnpm --filter @multica/web test
+pnpm --filter @multica/views test
+cd server && go test ./path/to/package -run TestName
+pnpm exec playwright test e2e/<spec>.spec.ts
+```
+
+Desktop local development is special: `pnpm dev:desktop` builds the CLI from source, creates an isolated desktop profile, and manages its own daemon. If the backend runs on a non-default port, point desktop at it with `apps/desktop/.env.development.local`.
 
 CI runs Node 22, Go 1.26.1, and a `pgvector/pgvector:pg17` PostgreSQL service.
+
+When editing setup/docs, keep README focused on product/runtime onboarding and keep CONTRIBUTING focused on contributor workflow, environment setup, and verification. Keep CLAUDE.md focused on non-obvious coding and architecture constraints.
 
 ## Coding Rules
 
@@ -221,6 +277,37 @@ Do not claim verification passed unless you ran it. If you skip checks because t
 - Commits should be atomic and use conventional prefixes: `feat(scope)`, `fix(scope)`, `refactor(scope)`, `docs`, `test(scope)`, `chore(scope)`.
 - A production deployment requires a CLI release tag on `main`: create `v0.x.x`, push it, and let `release.yml` publish binaries and the Homebrew tap.
 - Bump patch by default unless the user specifies a version.
+
+## Domain Reminders
+
+- All queries filter by `workspace_id`; membership gates access; `X-Workspace-ID` selects the workspace.
+- Issue assignees are polymorphic: `assignee_type` plus `assignee_id` can reference a member or an agent.
+
+## Fork / Workbench Adaptation Notes
+
+The repo itself is still Multica. If this fork evolves into a broader operations workbench, treat those ideas as fork-specific planning unless they already exist in code.
+
+For large adaptations, preserve these seams instead of hard-wiring external systems into core product logic:
+
+- keep external integrations behind connector-style boundaries
+- avoid teaching `packages/core`, `packages/views`, or backend domain logic about one specific ticketing/approval system unless it is already a first-class product concept
+- prefer normalized intermediate models and mapping layers over adding source-specific fields directly to core issue models
+- keep agent-facing tools stable even if underlying external systems differ
+
+Your local fork context currently includes `multiops-workbench.md`, which is a planning reference rather than source of truth for current behavior. Use it to guide fork architecture, not to infer that these capabilities already exist in the repository.
+
+If future work imports Ferry or other external system behavior from `/home/devops/projects/ferry_ops`, treat that as external integration context and verify boundaries explicitly before copying patterns into this repo.
+
+## Related Files
+
+- `README.md`: product model, runtime model, top-level architecture, install/getting-started
+- `CONTRIBUTING.md`: local workflow, worktrees, shared PostgreSQL, full verification pipeline
+- `AGENTS.md`: agent-specific repository guidance that points back to this file
+- `apps/mobile/CLAUDE.md`: mandatory rules before touching mobile
+- `apps/docs/content/docs/developers/conventions*.mdx`: naming, i18n glossary, Chinese voice
+- `server/internal/service/builtin_skills/*`: if product behavior or CLI changes, update the paired skill docs and source maps
+
+Keep this file concise. Add only rules and architecture that are easy to get wrong and expensive to rediscover from code alone.
 
 ## Domain Reminders
 
