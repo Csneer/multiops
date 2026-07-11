@@ -11,6 +11,108 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const acknowledgeWorkbenchResultDelivered = `-- name: AcknowledgeWorkbenchResultDelivered :execrows
+UPDATE workbench_result_outbox
+SET status = 'delivered',
+    lease_owner = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL,
+    last_status = $1,
+    last_error = NULL,
+    delivered_at = now(),
+    updated_at = now()
+WHERE id = $2
+  AND status = 'leased'
+  AND lease_token = $3
+`
+
+type AcknowledgeWorkbenchResultDeliveredParams struct {
+	LastStatus pgtype.Int4 `json:"last_status"`
+	ID         pgtype.UUID `json:"id"`
+	LeaseToken pgtype.UUID `json:"lease_token"`
+}
+
+func (q *Queries) AcknowledgeWorkbenchResultDelivered(ctx context.Context, arg AcknowledgeWorkbenchResultDeliveredParams) (int64, error) {
+	result, err := q.db.Exec(ctx, acknowledgeWorkbenchResultDelivered, arg.LastStatus, arg.ID, arg.LeaseToken)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const claimWorkbenchResults = `-- name: ClaimWorkbenchResults :many
+WITH candidates AS (
+    SELECT id
+    FROM workbench_result_outbox
+    WHERE (status = 'pending' AND next_attempt_at <= now())
+       OR (status = 'leased' AND lease_expires_at <= now())
+    ORDER BY
+        CASE WHEN status = 'leased' THEN lease_expires_at ELSE next_attempt_at END ASC,
+        created_at ASC,
+        id ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT $3
+)
+UPDATE workbench_result_outbox o
+SET status = 'leased',
+    lease_owner = $1,
+    lease_token = gen_random_uuid(),
+    lease_expires_at = now() + make_interval(secs => $2::double precision),
+    attempt_count = attempt_count + 1,
+    updated_at = now()
+FROM candidates
+WHERE o.id = candidates.id
+RETURNING o.id, o.workspace_id, o.connector_id, o.external_record_id, o.issue_id, o.task_id, o.outcome, o.status, o.payload, o.idempotency_key, o.attempt_count, o.next_attempt_at, o.lease_owner, o.lease_token, o.lease_expires_at, o.last_status, o.last_error, o.delivered_at, o.terminal_failed_at, o.created_at, o.updated_at
+`
+
+type ClaimWorkbenchResultsParams struct {
+	LeaseOwner   pgtype.Text `json:"lease_owner"`
+	LeaseSeconds float64     `json:"lease_seconds"`
+	BatchSize    int32       `json:"batch_size"`
+}
+
+func (q *Queries) ClaimWorkbenchResults(ctx context.Context, arg ClaimWorkbenchResultsParams) ([]WorkbenchResultOutbox, error) {
+	rows, err := q.db.Query(ctx, claimWorkbenchResults, arg.LeaseOwner, arg.LeaseSeconds, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []WorkbenchResultOutbox{}
+	for rows.Next() {
+		var i WorkbenchResultOutbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.ConnectorID,
+			&i.ExternalRecordID,
+			&i.IssueID,
+			&i.TaskID,
+			&i.Outcome,
+			&i.Status,
+			&i.Payload,
+			&i.IdempotencyKey,
+			&i.AttemptCount,
+			&i.NextAttemptAt,
+			&i.LeaseOwner,
+			&i.LeaseToken,
+			&i.LeaseExpiresAt,
+			&i.LastStatus,
+			&i.LastError,
+			&i.DeliveredAt,
+			&i.TerminalFailedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const completeIntegrationIngestAttempt = `-- name: CompleteIntegrationIngestAttempt :one
 UPDATE integration_ingest_attempt
 SET external_record_id = $2,
@@ -358,6 +460,103 @@ func (q *Queries) DisableEnabledIssueTemplate(ctx context.Context, arg DisableEn
 	return err
 }
 
+const enqueueWorkbenchResult = `-- name: EnqueueWorkbenchResult :one
+INSERT INTO workbench_result_outbox (
+    workspace_id, connector_id, external_record_id, issue_id, task_id,
+    outcome, payload, idempotency_key
+)
+SELECT
+    i.workspace_id,
+    r.connector_id,
+    r.id,
+    i.id,
+    t.id,
+    $1,
+    jsonb_build_object(
+        'version', 'v1',
+        'outcome', $1::text,
+        'workspace_id', i.workspace_id,
+        'connector_id', r.connector_id,
+        'external_record_id', r.id,
+        'external_id', r.external_id,
+        'external_key', r.external_key,
+        'issue_id', i.id,
+        'task_id', t.id,
+        'task_result', t.result,
+        'task_error', t.error,
+        'failure_reason', t.failure_reason,
+        'completed_at', t.completed_at
+    ),
+    'workbench-result:v1:' || t.id::text || ':' || $1::text
+FROM agent_task_queue t
+JOIN issue i ON i.id = t.issue_id
+JOIN LATERAL (
+    SELECT er.id, er.workspace_id, er.source_type, er.external_id, er.external_key, er.title, er.summary, er.source_status, er.source_url, er.schema_version, er.raw_payload_ref, er.last_seen_at, er.created_at, er.updated_at, er.connector_id, er.labels, er.fields
+    FROM issue_external_record_binding b
+    JOIN external_record er
+      ON er.id = b.external_record_id
+     AND er.workspace_id = b.workspace_id
+    WHERE b.workspace_id = i.workspace_id
+      AND b.issue_id = i.id
+      AND b.binding_role = 'primary'
+      AND er.connector_id IS NOT NULL
+    ORDER BY b.created_at ASC, b.id ASC
+    LIMIT 1
+) r ON true
+JOIN connector_instance ci
+  ON ci.id = r.connector_id
+ AND ci.workspace_id = i.workspace_id
+ AND ci.enabled
+ AND ci.connector_type = 'webhook'
+ AND ci.capabilities @> '{"result_delivery": true}'::jsonb
+JOIN workbench_webhook_connector wc
+  ON wc.connector_id = ci.id
+ AND wc.workspace_id = ci.workspace_id
+WHERE t.id = $2
+  AND t.status = CASE $1::text
+      WHEN 'completed' THEN 'completed'
+      WHEN 'failed' THEN 'failed'
+      ELSE ''
+  END
+ON CONFLICT (task_id, outcome) DO UPDATE
+SET task_id = workbench_result_outbox.task_id
+RETURNING id, workspace_id, connector_id, external_record_id, issue_id, task_id, outcome, status, payload, idempotency_key, attempt_count, next_attempt_at, lease_owner, lease_token, lease_expires_at, last_status, last_error, delivered_at, terminal_failed_at, created_at, updated_at
+`
+
+type EnqueueWorkbenchResultParams struct {
+	Outcome string      `json:"outcome"`
+	TaskID  pgtype.UUID `json:"task_id"`
+}
+
+func (q *Queries) EnqueueWorkbenchResult(ctx context.Context, arg EnqueueWorkbenchResultParams) (WorkbenchResultOutbox, error) {
+	row := q.db.QueryRow(ctx, enqueueWorkbenchResult, arg.Outcome, arg.TaskID)
+	var i WorkbenchResultOutbox
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ConnectorID,
+		&i.ExternalRecordID,
+		&i.IssueID,
+		&i.TaskID,
+		&i.Outcome,
+		&i.Status,
+		&i.Payload,
+		&i.IdempotencyKey,
+		&i.AttemptCount,
+		&i.NextAttemptAt,
+		&i.LeaseOwner,
+		&i.LeaseToken,
+		&i.LeaseExpiresAt,
+		&i.LastStatus,
+		&i.LastError,
+		&i.DeliveredAt,
+		&i.TerminalFailedAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getActiveConnectorCredentialByHash = `-- name: GetActiveConnectorCredentialByHash :one
 SELECT cc.id, cc.connector_id, cc.workspace_id, ci.connector_type
 FROM connector_credential cc
@@ -601,6 +800,61 @@ func (q *Queries) GetNextIssueTemplateVersion(ctx context.Context, arg GetNextIs
 	var version int32
 	err := row.Scan(&version)
 	return version, err
+}
+
+const getWorkbenchWebhookConnectorForDelivery = `-- name: GetWorkbenchWebhookConnectorForDelivery :one
+SELECT
+    ci.id AS connector_id,
+    ci.workspace_id,
+    ci.connector_type,
+    ci.capabilities,
+    ci.enabled,
+    wc.config_version,
+    wc.endpoint_url,
+    wc.timeout_ms,
+    wc.signing_secret_encrypted,
+    wc.signing_secret_prefix
+FROM connector_instance ci
+LEFT JOIN workbench_webhook_connector wc
+  ON wc.connector_id = ci.id
+ AND wc.workspace_id = ci.workspace_id
+WHERE ci.id = $1 AND ci.workspace_id = $2
+`
+
+type GetWorkbenchWebhookConnectorForDeliveryParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type GetWorkbenchWebhookConnectorForDeliveryRow struct {
+	ConnectorID            pgtype.UUID `json:"connector_id"`
+	WorkspaceID            pgtype.UUID `json:"workspace_id"`
+	ConnectorType          string      `json:"connector_type"`
+	Capabilities           []byte      `json:"capabilities"`
+	Enabled                bool        `json:"enabled"`
+	ConfigVersion          pgtype.Int4 `json:"config_version"`
+	EndpointUrl            pgtype.Text `json:"endpoint_url"`
+	TimeoutMs              pgtype.Int4 `json:"timeout_ms"`
+	SigningSecretEncrypted []byte      `json:"signing_secret_encrypted"`
+	SigningSecretPrefix    pgtype.Text `json:"signing_secret_prefix"`
+}
+
+func (q *Queries) GetWorkbenchWebhookConnectorForDelivery(ctx context.Context, arg GetWorkbenchWebhookConnectorForDeliveryParams) (GetWorkbenchWebhookConnectorForDeliveryRow, error) {
+	row := q.db.QueryRow(ctx, getWorkbenchWebhookConnectorForDelivery, arg.ID, arg.WorkspaceID)
+	var i GetWorkbenchWebhookConnectorForDeliveryRow
+	err := row.Scan(
+		&i.ConnectorID,
+		&i.WorkspaceID,
+		&i.ConnectorType,
+		&i.Capabilities,
+		&i.Enabled,
+		&i.ConfigVersion,
+		&i.EndpointUrl,
+		&i.TimeoutMs,
+		&i.SigningSecretEncrypted,
+		&i.SigningSecretPrefix,
+	)
+	return i, err
 }
 
 const hasAnyTaskHistoryForIssue = `-- name: HasAnyTaskHistoryForIssue :one
@@ -1064,6 +1318,39 @@ func (q *Queries) LockIssueForNeverEnqueuedReconciliation(ctx context.Context, a
 	return i, err
 }
 
+const lockWebhookConnectorForConfiguration = `-- name: LockWebhookConnectorForConfiguration :one
+SELECT id, workspace_id, connector_type, capabilities, enabled
+FROM connector_instance
+WHERE id = $1 AND workspace_id = $2
+FOR UPDATE
+`
+
+type LockWebhookConnectorForConfigurationParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+type LockWebhookConnectorForConfigurationRow struct {
+	ID            pgtype.UUID `json:"id"`
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
+	ConnectorType string      `json:"connector_type"`
+	Capabilities  []byte      `json:"capabilities"`
+	Enabled       bool        `json:"enabled"`
+}
+
+func (q *Queries) LockWebhookConnectorForConfiguration(ctx context.Context, arg LockWebhookConnectorForConfigurationParams) (LockWebhookConnectorForConfigurationRow, error) {
+	row := q.db.QueryRow(ctx, lockWebhookConnectorForConfiguration, arg.ID, arg.WorkspaceID)
+	var i LockWebhookConnectorForConfigurationRow
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ConnectorType,
+		&i.Capabilities,
+		&i.Enabled,
+	)
+	return i, err
+}
+
 const recordOrBumpIntegrationIngestAttempt = `-- name: RecordOrBumpIntegrationIngestAttempt :one
 INSERT INTO integration_ingest_attempt (
     workspace_id, source_type, idempotency_key, connector_id, request_fingerprint,
@@ -1142,6 +1429,43 @@ func (q *Queries) RecordOrBumpIntegrationIngestAttempt(ctx context.Context, arg 
 	return i, err
 }
 
+const retryWorkbenchResult = `-- name: RetryWorkbenchResult :execrows
+UPDATE workbench_result_outbox
+SET status = 'pending',
+    lease_owner = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL,
+    next_attempt_at = $1,
+    last_status = $2,
+    last_error = $3,
+    updated_at = now()
+WHERE id = $4
+  AND status = 'leased'
+  AND lease_token = $5
+`
+
+type RetryWorkbenchResultParams struct {
+	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
+	LastStatus    pgtype.Int4        `json:"last_status"`
+	LastError     pgtype.Text        `json:"last_error"`
+	ID            pgtype.UUID        `json:"id"`
+	LeaseToken    pgtype.UUID        `json:"lease_token"`
+}
+
+func (q *Queries) RetryWorkbenchResult(ctx context.Context, arg RetryWorkbenchResultParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retryWorkbenchResult,
+		arg.NextAttemptAt,
+		arg.LastStatus,
+		arg.LastError,
+		arg.ID,
+		arg.LeaseToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const revokeConnectorCredential = `-- name: RevokeConnectorCredential :execrows
 UPDATE connector_credential
 SET revoked_at = now()
@@ -1160,6 +1484,49 @@ func (q *Queries) RevokeConnectorCredential(ctx context.Context, arg RevokeConne
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const rotateWorkbenchWebhookSecret = `-- name: RotateWorkbenchWebhookSecret :one
+UPDATE workbench_webhook_connector
+SET signing_secret_encrypted = $3,
+    signing_secret_prefix = $4,
+    updated_by = $5,
+    updated_at = now()
+WHERE connector_id = $1 AND workspace_id = $2
+RETURNING connector_id, workspace_id, config_version, endpoint_url, timeout_ms, signing_secret_encrypted, signing_secret_prefix, created_by, updated_by, created_at, updated_at
+`
+
+type RotateWorkbenchWebhookSecretParams struct {
+	ConnectorID            pgtype.UUID `json:"connector_id"`
+	WorkspaceID            pgtype.UUID `json:"workspace_id"`
+	SigningSecretEncrypted []byte      `json:"signing_secret_encrypted"`
+	SigningSecretPrefix    string      `json:"signing_secret_prefix"`
+	UpdatedBy              pgtype.UUID `json:"updated_by"`
+}
+
+func (q *Queries) RotateWorkbenchWebhookSecret(ctx context.Context, arg RotateWorkbenchWebhookSecretParams) (WorkbenchWebhookConnector, error) {
+	row := q.db.QueryRow(ctx, rotateWorkbenchWebhookSecret,
+		arg.ConnectorID,
+		arg.WorkspaceID,
+		arg.SigningSecretEncrypted,
+		arg.SigningSecretPrefix,
+		arg.UpdatedBy,
+	)
+	var i WorkbenchWebhookConnector
+	err := row.Scan(
+		&i.ConnectorID,
+		&i.WorkspaceID,
+		&i.ConfigVersion,
+		&i.EndpointUrl,
+		&i.TimeoutMs,
+		&i.SigningSecretEncrypted,
+		&i.SigningSecretPrefix,
+		&i.CreatedBy,
+		&i.UpdatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const selectMatchingIssueTemplate = `-- name: SelectMatchingIssueTemplate :one
@@ -1214,6 +1581,41 @@ func (q *Queries) SelectMatchingIssueTemplate(ctx context.Context, arg SelectMat
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const terminalFailWorkbenchResult = `-- name: TerminalFailWorkbenchResult :execrows
+UPDATE workbench_result_outbox
+SET status = 'terminal_failed',
+    lease_owner = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL,
+    last_status = $1,
+    last_error = $2,
+    terminal_failed_at = now(),
+    updated_at = now()
+WHERE id = $3
+  AND status = 'leased'
+  AND lease_token = $4
+`
+
+type TerminalFailWorkbenchResultParams struct {
+	LastStatus pgtype.Int4 `json:"last_status"`
+	LastError  pgtype.Text `json:"last_error"`
+	ID         pgtype.UUID `json:"id"`
+	LeaseToken pgtype.UUID `json:"lease_token"`
+}
+
+func (q *Queries) TerminalFailWorkbenchResult(ctx context.Context, arg TerminalFailWorkbenchResultParams) (int64, error) {
+	result, err := q.db.Exec(ctx, terminalFailWorkbenchResult,
+		arg.LastStatus,
+		arg.LastError,
+		arg.ID,
+		arg.LeaseToken,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateConnectorCredentialLastUsed = `-- name: UpdateConnectorCredentialLastUsed :exec
@@ -1333,6 +1735,60 @@ func (q *Queries) UpsertExternalRecord(ctx context.Context, arg UpsertExternalRe
 		&i.Labels,
 		&i.Fields,
 		&i.Inserted,
+	)
+	return i, err
+}
+
+const upsertWorkbenchWebhookConnector = `-- name: UpsertWorkbenchWebhookConnector :one
+INSERT INTO workbench_webhook_connector (
+    connector_id, workspace_id, config_version, endpoint_url, timeout_ms,
+    signing_secret_encrypted, signing_secret_prefix, created_by, updated_by
+) VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $7)
+ON CONFLICT (connector_id) DO UPDATE
+SET config_version = 1,
+    endpoint_url = EXCLUDED.endpoint_url,
+    timeout_ms = EXCLUDED.timeout_ms,
+    signing_secret_encrypted = EXCLUDED.signing_secret_encrypted,
+    signing_secret_prefix = EXCLUDED.signing_secret_prefix,
+    updated_by = EXCLUDED.updated_by,
+    updated_at = now()
+WHERE workbench_webhook_connector.workspace_id = EXCLUDED.workspace_id
+RETURNING connector_id, workspace_id, config_version, endpoint_url, timeout_ms, signing_secret_encrypted, signing_secret_prefix, created_by, updated_by, created_at, updated_at
+`
+
+type UpsertWorkbenchWebhookConnectorParams struct {
+	ConnectorID            pgtype.UUID `json:"connector_id"`
+	WorkspaceID            pgtype.UUID `json:"workspace_id"`
+	EndpointUrl            string      `json:"endpoint_url"`
+	TimeoutMs              int32       `json:"timeout_ms"`
+	SigningSecretEncrypted []byte      `json:"signing_secret_encrypted"`
+	SigningSecretPrefix    string      `json:"signing_secret_prefix"`
+	CreatedBy              pgtype.UUID `json:"created_by"`
+}
+
+func (q *Queries) UpsertWorkbenchWebhookConnector(ctx context.Context, arg UpsertWorkbenchWebhookConnectorParams) (WorkbenchWebhookConnector, error) {
+	row := q.db.QueryRow(ctx, upsertWorkbenchWebhookConnector,
+		arg.ConnectorID,
+		arg.WorkspaceID,
+		arg.EndpointUrl,
+		arg.TimeoutMs,
+		arg.SigningSecretEncrypted,
+		arg.SigningSecretPrefix,
+		arg.CreatedBy,
+	)
+	var i WorkbenchWebhookConnector
+	err := row.Scan(
+		&i.ConnectorID,
+		&i.WorkspaceID,
+		&i.ConfigVersion,
+		&i.EndpointUrl,
+		&i.TimeoutMs,
+		&i.SigningSecretEncrypted,
+		&i.SigningSecretPrefix,
+		&i.CreatedBy,
+		&i.UpdatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }

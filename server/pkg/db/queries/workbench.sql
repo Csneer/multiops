@@ -30,6 +30,55 @@ SET enabled = false, updated_at = now()
 WHERE id = $1 AND workspace_id = $2
 RETURNING id, workspace_id, key, name, connector_type, capabilities, enabled, created_at, updated_at;
 
+-- name: LockWebhookConnectorForConfiguration :one
+SELECT id, workspace_id, connector_type, capabilities, enabled
+FROM connector_instance
+WHERE id = $1 AND workspace_id = $2
+FOR UPDATE;
+
+-- name: UpsertWorkbenchWebhookConnector :one
+INSERT INTO workbench_webhook_connector (
+    connector_id, workspace_id, config_version, endpoint_url, timeout_ms,
+    signing_secret_encrypted, signing_secret_prefix, created_by, updated_by
+) VALUES ($1, $2, 1, $3, $4, $5, $6, $7, $7)
+ON CONFLICT (connector_id) DO UPDATE
+SET config_version = 1,
+    endpoint_url = EXCLUDED.endpoint_url,
+    timeout_ms = EXCLUDED.timeout_ms,
+    signing_secret_encrypted = EXCLUDED.signing_secret_encrypted,
+    signing_secret_prefix = EXCLUDED.signing_secret_prefix,
+    updated_by = EXCLUDED.updated_by,
+    updated_at = now()
+WHERE workbench_webhook_connector.workspace_id = EXCLUDED.workspace_id
+RETURNING *;
+
+-- name: RotateWorkbenchWebhookSecret :one
+UPDATE workbench_webhook_connector
+SET signing_secret_encrypted = $3,
+    signing_secret_prefix = $4,
+    updated_by = $5,
+    updated_at = now()
+WHERE connector_id = $1 AND workspace_id = $2
+RETURNING *;
+
+-- name: GetWorkbenchWebhookConnectorForDelivery :one
+SELECT
+    ci.id AS connector_id,
+    ci.workspace_id,
+    ci.connector_type,
+    ci.capabilities,
+    ci.enabled,
+    wc.config_version,
+    wc.endpoint_url,
+    wc.timeout_ms,
+    wc.signing_secret_encrypted,
+    wc.signing_secret_prefix
+FROM connector_instance ci
+LEFT JOIN workbench_webhook_connector wc
+  ON wc.connector_id = ci.id
+ AND wc.workspace_id = ci.workspace_id
+WHERE ci.id = $1 AND ci.workspace_id = $2;
+
 -- name: CreateConnectorCredential :one
 INSERT INTO connector_credential (
     connector_id, workspace_id, name, token_hash, token_prefix, created_by
@@ -256,3 +305,131 @@ JOIN external_record r ON r.id = b.external_record_id
 WHERE b.workspace_id = $1
   AND b.issue_id = $2
 ORDER BY b.created_at DESC;
+
+-- name: EnqueueWorkbenchResult :one
+INSERT INTO workbench_result_outbox (
+    workspace_id, connector_id, external_record_id, issue_id, task_id,
+    outcome, payload, idempotency_key
+)
+SELECT
+    i.workspace_id,
+    r.connector_id,
+    r.id,
+    i.id,
+    t.id,
+    sqlc.arg('outcome'),
+    jsonb_build_object(
+        'version', 'v1',
+        'outcome', sqlc.arg('outcome')::text,
+        'workspace_id', i.workspace_id,
+        'connector_id', r.connector_id,
+        'external_record_id', r.id,
+        'external_id', r.external_id,
+        'external_key', r.external_key,
+        'issue_id', i.id,
+        'task_id', t.id,
+        'task_result', t.result,
+        'task_error', t.error,
+        'failure_reason', t.failure_reason,
+        'completed_at', t.completed_at
+    ),
+    'workbench-result:v1:' || t.id::text || ':' || sqlc.arg('outcome')::text
+FROM agent_task_queue t
+JOIN issue i ON i.id = t.issue_id
+JOIN LATERAL (
+    SELECT er.*
+    FROM issue_external_record_binding b
+    JOIN external_record er
+      ON er.id = b.external_record_id
+     AND er.workspace_id = b.workspace_id
+    WHERE b.workspace_id = i.workspace_id
+      AND b.issue_id = i.id
+      AND b.binding_role = 'primary'
+      AND er.connector_id IS NOT NULL
+    ORDER BY b.created_at ASC, b.id ASC
+    LIMIT 1
+) r ON true
+JOIN connector_instance ci
+  ON ci.id = r.connector_id
+ AND ci.workspace_id = i.workspace_id
+ AND ci.enabled
+ AND ci.connector_type = 'webhook'
+ AND ci.capabilities @> '{"result_delivery": true}'::jsonb
+JOIN workbench_webhook_connector wc
+  ON wc.connector_id = ci.id
+ AND wc.workspace_id = ci.workspace_id
+WHERE t.id = sqlc.arg('task_id')
+  AND t.status = CASE sqlc.arg('outcome')::text
+      WHEN 'completed' THEN 'completed'
+      WHEN 'failed' THEN 'failed'
+      ELSE ''
+  END
+ON CONFLICT (task_id, outcome) DO UPDATE
+SET task_id = workbench_result_outbox.task_id
+RETURNING *;
+
+-- name: ClaimWorkbenchResults :many
+WITH candidates AS (
+    SELECT id
+    FROM workbench_result_outbox
+    WHERE (status = 'pending' AND next_attempt_at <= now())
+       OR (status = 'leased' AND lease_expires_at <= now())
+    ORDER BY
+        CASE WHEN status = 'leased' THEN lease_expires_at ELSE next_attempt_at END ASC,
+        created_at ASC,
+        id ASC
+    FOR UPDATE SKIP LOCKED
+    LIMIT sqlc.arg('batch_size')
+)
+UPDATE workbench_result_outbox o
+SET status = 'leased',
+    lease_owner = sqlc.arg('lease_owner'),
+    lease_token = gen_random_uuid(),
+    lease_expires_at = now() + make_interval(secs => sqlc.arg('lease_seconds')::double precision),
+    attempt_count = attempt_count + 1,
+    updated_at = now()
+FROM candidates
+WHERE o.id = candidates.id
+RETURNING o.*;
+
+-- name: AcknowledgeWorkbenchResultDelivered :execrows
+UPDATE workbench_result_outbox
+SET status = 'delivered',
+    lease_owner = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL,
+    last_status = sqlc.narg('last_status'),
+    last_error = NULL,
+    delivered_at = now(),
+    updated_at = now()
+WHERE id = sqlc.arg('id')
+  AND status = 'leased'
+  AND lease_token = sqlc.arg('lease_token');
+
+-- name: RetryWorkbenchResult :execrows
+UPDATE workbench_result_outbox
+SET status = 'pending',
+    lease_owner = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL,
+    next_attempt_at = sqlc.arg('next_attempt_at'),
+    last_status = sqlc.narg('last_status'),
+    last_error = sqlc.narg('last_error'),
+    updated_at = now()
+WHERE id = sqlc.arg('id')
+  AND status = 'leased'
+  AND lease_token = sqlc.arg('lease_token');
+
+-- name: TerminalFailWorkbenchResult :execrows
+UPDATE workbench_result_outbox
+SET status = 'terminal_failed',
+    lease_owner = NULL,
+    lease_token = NULL,
+    lease_expires_at = NULL,
+    last_status = sqlc.narg('last_status'),
+    last_error = sqlc.narg('last_error'),
+    terminal_failed_at = now(),
+    updated_at = now()
+WHERE id = sqlc.arg('id')
+  AND status = 'leased'
+  AND lease_token = sqlc.arg('lease_token');

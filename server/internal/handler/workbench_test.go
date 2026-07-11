@@ -973,6 +973,137 @@ func TestWorkbenchMemberCannotCreateConnectorOrTemplate(t *testing.T) {
 	}
 }
 
+func TestWebhookConnectorConfigurationRotationEncryptionAndPermissions(t *testing.T) {
+	wCreate := httptest.NewRecorder()
+	testHandler.CreateConnector(wCreate, newRequest(http.MethodPost, "/api/connectors", map[string]any{"key": "webhook-config", "name": "webhook-config", "type": "webhook", "capabilities": map[string]any{"result_delivery": true}}))
+	if wCreate.Code != http.StatusCreated {
+		t.Fatalf("create webhook: %d %s", wCreate.Code, wCreate.Body.String())
+	}
+	var created ConnectorResponse
+	if err := json.NewDecoder(wCreate.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	connectorID := created.ID
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM connector_instance WHERE id=$1`, connectorID) })
+	configure := func(userID, workspaceID string, body any) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := newRequestAs(userID, http.MethodPut, "/api/connectors/"+connectorID+"/webhook", body)
+		req.Header.Set("X-Workspace-ID", workspaceID)
+		req = withURLParam(req, "connectorId", connectorID)
+		testHandler.ConfigureWebhookConnector(w, req)
+		return w
+	}
+	w := configure(testUserID, testWorkspaceID, map[string]any{"version": 1, "url": "https://hooks.example.com/result", "timeout_ms": 5000})
+	if w.Code != http.StatusOK {
+		t.Fatalf("configure: %d %s", w.Code, w.Body.String())
+	}
+	var first WebhookConfigurationResponse
+	if err := json.NewDecoder(w.Body).Decode(&first); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(first.Secret, "mws_") || first.SecretPrefix != first.Secret[:12] {
+		t.Fatalf("secret response=%+v", first)
+	}
+	var encrypted []byte
+	var prefix string
+	var config string
+	if err := testPool.QueryRow(context.Background(), `SELECT wc.signing_secret_encrypted,wc.signing_secret_prefix,ci.config::text FROM workbench_webhook_connector wc JOIN connector_instance ci ON ci.id=wc.connector_id WHERE wc.connector_id=$1`, connectorID).Scan(&encrypted, &prefix, &config); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encrypted), first.Secret) || prefix != first.SecretPrefix || config != "{}" {
+		t.Fatal("plaintext secret/config leaked to storage")
+	}
+	memberID := createWorkbenchMember(t, "member")
+	denied := configure(memberID, testWorkspaceID, map[string]any{"version": 1, "url": "https://hooks.example.com/result", "timeout_ms": 5000})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("member status=%d", denied.Code)
+	}
+	var foreign string
+	if err := testPool.QueryRow(context.Background(), `INSERT INTO workspace(name,slug,description,issue_prefix) VALUES ('Webhook foreign','webhook-foreign-'||gen_random_uuid(),'','WHF') RETURNING id`).Scan(&foreign); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM workspace WHERE id=$1`, foreign) })
+	cross := configure(testUserID, foreign, map[string]any{"version": 1, "url": "https://hooks.example.com/result", "timeout_ms": 5000})
+	if cross.Code != http.StatusNotFound {
+		t.Fatalf("cross status=%d", cross.Code)
+	}
+	rotate := httptest.NewRecorder()
+	req := newRequest(http.MethodPost, "/api/connectors/"+connectorID+"/webhook/rotate-secret", map[string]any{})
+	req = withURLParam(req, "connectorId", connectorID)
+	testHandler.RotateWebhookConnectorSecret(rotate, req)
+	if rotate.Code != http.StatusOK {
+		t.Fatalf("rotate=%d %s", rotate.Code, rotate.Body.String())
+	}
+	var second WebhookConfigurationResponse
+	json.NewDecoder(rotate.Body).Decode(&second)
+	if second.Secret == first.Secret || strings.Contains(rotate.Body.String(), first.Secret) {
+		t.Fatal("rotation did not replace secret safely")
+	}
+	list := httptest.NewRecorder()
+	testHandler.ListConnectors(list, newRequest(http.MethodGet, "/api/connectors", nil))
+	if strings.Contains(list.Body.String(), first.Secret) || strings.Contains(list.Body.String(), second.Secret) || strings.Contains(list.Body.String(), "endpoint_url") {
+		t.Fatal("public DTO leaked webhook configuration")
+	}
+}
+
+func TestWorkbenchWebhookConnectorDatabaseConstraints(t *testing.T) {
+	w := httptest.NewRecorder()
+	testHandler.CreateConnector(w, newRequest(http.MethodPost, "/api/connectors", map[string]any{"key": "webhook-constraints", "name": "webhook-constraints", "type": "webhook", "capabilities": map[string]any{"result_delivery": true}}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create connector: %d %s", w.Code, w.Body.String())
+	}
+	var connector ConnectorResponse
+	if err := json.NewDecoder(w.Body).Decode(&connector); err != nil {
+		t.Fatal(err)
+	}
+	connectorID := connector.ID
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM connector_instance WHERE id=$1`, connectorID) })
+	createdBy := parseUUID(testUserID)
+	workspaceID := parseUUID(testWorkspaceID)
+	connectorUUID := parseUUID(connectorID)
+	for _, tc := range []struct {
+		name       string
+		version    int
+		timeout    int
+		ciphertext []byte
+		prefix     string
+	}{
+		{name: "empty ciphertext", version: 1, timeout: 5000, ciphertext: []byte{}, prefix: "mws_0123abcd"},
+		{name: "short ciphertext", version: 1, timeout: 5000, ciphertext: make([]byte, 28), prefix: "mws_0123abcd"},
+		{name: "malformed prefix", version: 1, timeout: 5000, ciphertext: make([]byte, 29), prefix: "mws_0123ABCD"},
+		{name: "invalid timeout", version: 1, timeout: 999, ciphertext: make([]byte, 29), prefix: "mws_0123abcd"},
+		{name: "invalid version", version: 2, timeout: 5000, ciphertext: make([]byte, 29), prefix: "mws_0123abcd"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := testPool.Exec(context.Background(), `INSERT INTO workbench_webhook_connector (connector_id,workspace_id,config_version,endpoint_url,timeout_ms,signing_secret_encrypted,signing_secret_prefix,created_by,updated_by) VALUES ($1,$2,$3,'https://hooks.example.com/result',$4,$5,$6,$7,$7)`, connectorUUID, workspaceID, tc.version, tc.timeout, tc.ciphertext, tc.prefix, createdBy)
+			if err == nil {
+				t.Fatal("invalid webhook connector insert succeeded")
+			}
+		})
+	}
+}
+
+func TestWebhookConfigurationFailsClosedWithoutSecretbox(t *testing.T) {
+	wCreate := httptest.NewRecorder()
+	testHandler.CreateConnector(wCreate, newRequest(http.MethodPost, "/api/connectors", map[string]any{"key": "webhook-no-box", "name": "webhook-no-box", "type": "webhook", "capabilities": map[string]any{"result_delivery": true}}))
+	if wCreate.Code != http.StatusCreated {
+		t.Fatalf("create=%d %s", wCreate.Code, wCreate.Body.String())
+	}
+	var created ConnectorResponse
+	json.NewDecoder(wCreate.Body).Decode(&created)
+	connectorID := created.ID
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM connector_instance WHERE id=$1`, connectorID) })
+	old := testHandler.WorkbenchSecretBox
+	testHandler.WorkbenchSecretBox = nil
+	t.Cleanup(func() { testHandler.WorkbenchSecretBox = old })
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest(http.MethodPut, "/api/connectors/"+connectorID+"/webhook", map[string]any{"version": 1, "url": "https://hooks.example.com/result", "timeout_ms": 5000}), "connectorId", connectorID)
+	testHandler.ConfigureWebhookConnector(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestCreateConnectorReturnsSafeDTOAndRejectsTrailingJSON(t *testing.T) {
 	body := `{"key":"safe-dto","name":"Safe DTO","type":"ferry","config":{"secret":"hidden"}} trailing`
 	req := newRequest(http.MethodPost, "/api/connectors", nil)

@@ -1041,6 +1041,44 @@ type WebhookDelivery struct {
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 }
 
+type WorkbenchResultOutbox struct {
+	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	ConnectorID      pgtype.UUID        `json:"connector_id"`
+	ExternalRecordID pgtype.UUID        `json:"external_record_id"`
+	IssueID          pgtype.UUID        `json:"issue_id"`
+	TaskID           pgtype.UUID        `json:"task_id"`
+	Outcome          string             `json:"outcome"`
+	Status           string             `json:"status"`
+	Payload          []byte             `json:"payload"`
+	IdempotencyKey   string             `json:"idempotency_key"`
+	AttemptCount     int32              `json:"attempt_count"`
+	NextAttemptAt    pgtype.Timestamptz `json:"next_attempt_at"`
+	LeaseOwner       pgtype.Text        `json:"lease_owner"`
+	LeaseToken       pgtype.UUID        `json:"lease_token"`
+	LeaseExpiresAt   pgtype.Timestamptz `json:"lease_expires_at"`
+	LastStatus       pgtype.Int4        `json:"last_status"`
+	LastError        pgtype.Text        `json:"last_error"`
+	DeliveredAt      pgtype.Timestamptz `json:"delivered_at"`
+	TerminalFailedAt pgtype.Timestamptz `json:"terminal_failed_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkbenchWebhookConnector struct {
+	ConnectorID            pgtype.UUID        `json:"connector_id"`
+	WorkspaceID            pgtype.UUID        `json:"workspace_id"`
+	ConfigVersion          int32              `json:"config_version"`
+	EndpointUrl            string             `json:"endpoint_url"`
+	TimeoutMs              int32              `json:"timeout_ms"`
+	SigningSecretEncrypted []byte             `json:"signing_secret_encrypted"`
+	SigningSecretPrefix    string             `json:"signing_secret_prefix"`
+	CreatedBy              pgtype.UUID        `json:"created_by"`
+	UpdatedBy              pgtype.UUID        `json:"updated_by"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Workspace struct {
 	ID           pgtype.UUID        `json:"id"`
 	Name         string             `json:"name"`

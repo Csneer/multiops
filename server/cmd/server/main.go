@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -21,6 +24,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/scheduler"
 	"github.com/multica-ai/multica/server/internal/service"
+	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
 	"github.com/redis/go-redis/v9"
@@ -135,6 +139,26 @@ func envBool(name string, def bool) bool {
 		return def
 	}
 	return v
+}
+
+func loadWorkbenchSecretBox(lookupEnv func(string) (string, bool), newBox func([]byte) (*secretbox.Box, error)) (*secretbox.Box, bool, error) {
+	raw, present := lookupEnv("MULTICA_WORKBENCH_SECRET_KEY")
+	if !present {
+		return nil, false, nil
+	}
+	key, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return nil, true, fmt.Errorf("decode MULTICA_WORKBENCH_SECRET_KEY: %w", err)
+	}
+	if len(key) != secretbox.KeySize {
+		return nil, true, fmt.Errorf("MULTICA_WORKBENCH_SECRET_KEY decodes to %d bytes, expected %d", len(key), secretbox.KeySize)
+	}
+	box, err := newBox(key)
+	clear(key)
+	if err != nil {
+		return nil, true, fmt.Errorf("initialize workbench secretbox: %w", err)
+	}
+	return box, true, nil
 }
 
 func main() {
@@ -352,6 +376,15 @@ func main() {
 	// shutdown so any pending bumps are flushed before we exit.
 	heartbeatScheduler := handler.NewBatchedHeartbeatScheduler(queries, handler.DefaultHeartbeatBatchInterval)
 
+	workbenchBox, webhookConfigured, err := loadWorkbenchSecretBox(os.LookupEnv, secretbox.New)
+	if err != nil {
+		slog.Error("workbench webhook secret key is invalid", "error", err)
+		os.Exit(1)
+	}
+	if !webhookConfigured {
+		slog.Warn("workbench webhook disabled (MULTICA_WORKBENCH_SECRET_KEY not set)")
+	}
+
 	r, h := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
 		HTTPMetrics:        httpMetrics,
 		BusinessMetrics:    businessMetrics,
@@ -359,6 +392,7 @@ func main() {
 		DaemonWakeup:       daemonWakeup,
 		FeatureFlags:       flags,
 		HeartbeatScheduler: heartbeatScheduler,
+		WorkbenchSecretBox: workbenchBox,
 	})
 
 	srv := &http.Server{
@@ -389,6 +423,27 @@ func main() {
 	go heartbeatScheduler.Run(sweepCtx)
 	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
 	go runDBStatsLogger(sweepCtx, pool)
+	var resultOutboxDone chan struct{}
+	if workbenchBox != nil {
+		deliverer, delivererErr := service.NewWebhookResultDeliverer(queries, workbenchBox, service.WebhookTransportOptions{})
+		if delivererErr != nil {
+			slog.Error("workbench result outbox disabled", "error", delivererErr)
+		} else {
+			dispatcher := service.NewConnectorResultDispatcher(queries)
+			dispatcher.Register(service.WebhookConnectorType, deliverer)
+			resultOutboxDone = make(chan struct{})
+			worker := &service.ResultOutboxWorker{Queries: queries, Deliverer: dispatcher, LeaseOwner: "server-" + strconv.Itoa(os.Getpid())}
+			go func() {
+				defer close(resultOutboxDone)
+				if runErr := worker.Run(sweepCtx); runErr != nil && !errors.Is(runErr, context.Canceled) {
+					slog.Error("workbench result outbox stopped", "error", runErr)
+				}
+			}()
+			slog.Info("workbench result outbox enabled")
+		}
+	} else {
+		slog.Info("workbench result outbox disabled; pending rows retained")
+	}
 
 	// Channel inbound supervisor (MUL-3620): holds the §4.4 WS lease per
 	// installation and drives each channel.Channel. It is built
@@ -472,6 +527,13 @@ func main() {
 	// final batch of queued heartbeat bumps.
 	sweepCancel()
 	heartbeatScheduler.Stop()
+	if resultOutboxDone != nil {
+		select {
+		case <-resultOutboxDone:
+		case <-time.After(5 * time.Second):
+			slog.Warn("workbench result outbox did not stop within shutdown timeout")
+		}
+	}
 
 	// Join the channel supervisor's per-installation goroutines so the
 	// lease renewer can issue a final release before process exit;

@@ -2,7 +2,9 @@ package handler
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,20 @@ type CreateConnectorRequest struct {
 
 type CreateConnectorCredentialRequest struct {
 	Name string `json:"name"`
+}
+
+type ConfigureWebhookRequest struct {
+	Version   int32  `json:"version"`
+	URL       string `json:"url"`
+	TimeoutMS int32  `json:"timeout_ms"`
+}
+
+type WebhookConfigurationResponse struct {
+	Version      int32  `json:"version"`
+	URL          string `json:"url"`
+	TimeoutMS    int32  `json:"timeout_ms"`
+	SecretPrefix string `json:"secret_prefix"`
+	Secret       string `json:"secret,omitempty"`
 }
 
 type workbenchConnector struct {
@@ -221,6 +237,17 @@ func (h *Handler) CreateConnector(w http.ResponseWriter, r *http.Request) {
 	if req.Config == nil {
 		req.Config = map[string]any{}
 	}
+	connectorType := strings.TrimSpace(req.Type)
+	if connectorType == service.WebhookConnectorType {
+		if len(req.Config) != 0 {
+			writeError(w, http.StatusBadRequest, "webhook config must be set through the webhook configuration endpoint")
+			return
+		}
+		if len(req.Capabilities) != 1 || req.Capabilities[service.WebhookResultCapability] != true {
+			writeError(w, http.StatusBadRequest, "webhook connector requires only the result_delivery capability")
+			return
+		}
+	}
 	capabilities, _ := json.Marshal(req.Capabilities)
 	config, _ := json.Marshal(req.Config)
 	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
@@ -236,7 +263,7 @@ func (h *Handler) CreateConnector(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		enabled = *req.Enabled
 	}
-	row, err := h.Queries.CreateConnectorInstance(r.Context(), db.CreateConnectorInstanceParams{WorkspaceID: workspaceID, Key: strings.TrimSpace(req.Key), Name: strings.TrimSpace(req.Name), ConnectorType: strings.TrimSpace(req.Type), Capabilities: capabilities, Config: config, Enabled: enabled, CreatedBy: parseUUID(creator)})
+	row, err := h.Queries.CreateConnectorInstance(r.Context(), db.CreateConnectorInstanceParams{WorkspaceID: workspaceID, Key: strings.TrimSpace(req.Key), Name: strings.TrimSpace(req.Name), ConnectorType: connectorType, Capabilities: capabilities, Config: config, Enabled: enabled, CreatedBy: parseUUID(creator)})
 	if err != nil {
 		if isUniqueViolation(err) {
 			writeError(w, http.StatusConflict, "connector key already exists")
@@ -246,6 +273,151 @@ func (h *Handler) CreateConnector(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, connectorResponseParts(row.ID, row.Key, row.Name, row.ConnectorType, row.Capabilities, row.Enabled, row.CreatedAt, row.UpdatedAt))
+}
+
+func (h *Handler) ConfigureWebhookConnector(w http.ResponseWriter, r *http.Request) {
+	if h.WorkbenchSecretBox == nil {
+		writeError(w, http.StatusServiceUnavailable, "workbench webhook encryption is not configured")
+		return
+	}
+	var req ConfigureWebhookRequest
+	if !decodeWorkbenchJSON(w, r, &req) {
+		return
+	}
+	if _, err := service.ValidateWebhookConfig(service.WebhookConfig{Version: req.Version, URL: req.URL, TimeoutMS: req.TimeoutMS}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	connectorID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "connectorId"), "connector id")
+	if !ok {
+		return
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	if !ok {
+		return
+	}
+	member, ok := h.requireWorkspaceRole(w, r, uuidToString(workspaceID), "connector not found", "owner", "admin")
+	if !ok {
+		return
+	}
+	secret, encrypted, prefix, err := h.generateWebhookSecret()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate webhook secret")
+		return
+	}
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to configure webhook")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+	connector, err := qtx.LockWebhookConnectorForConfiguration(r.Context(), db.LockWebhookConnectorForConfigurationParams{ID: connectorID, WorkspaceID: workspaceID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "connector not found")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to configure webhook")
+		return
+	}
+	if connector.ConnectorType != service.WebhookConnectorType || !webhookResultCapability(connector.Capabilities) {
+		writeError(w, http.StatusBadRequest, "connector must be a webhook with result_delivery capability")
+		return
+	}
+	row, err := qtx.UpsertWorkbenchWebhookConnector(r.Context(), db.UpsertWorkbenchWebhookConnectorParams{ConnectorID: connectorID, WorkspaceID: workspaceID, EndpointUrl: req.URL, TimeoutMs: req.TimeoutMS, SigningSecretEncrypted: encrypted, SigningSecretPrefix: prefix, CreatedBy: member.UserID})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to configure webhook")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to configure webhook")
+		return
+	}
+	writeJSON(w, http.StatusOK, WebhookConfigurationResponse{Version: row.ConfigVersion, URL: row.EndpointUrl, TimeoutMS: row.TimeoutMs, SecretPrefix: row.SigningSecretPrefix, Secret: secret})
+}
+
+func (h *Handler) RotateWebhookConnectorSecret(w http.ResponseWriter, r *http.Request) {
+	if h.WorkbenchSecretBox == nil {
+		writeError(w, http.StatusServiceUnavailable, "workbench webhook encryption is not configured")
+		return
+	}
+	if !decodeWorkbenchJSON(w, r, &struct{}{}) {
+		return
+	}
+	connectorID, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "connectorId"), "connector id")
+	if !ok {
+		return
+	}
+	workspaceID, ok := parseUUIDOrBadRequest(w, h.resolveWorkspaceID(r), "workspace id")
+	if !ok {
+		return
+	}
+	member, ok := h.requireWorkspaceRole(w, r, uuidToString(workspaceID), "connector not found", "owner", "admin")
+	if !ok {
+		return
+	}
+	secret, encrypted, prefix, err := h.generateWebhookSecret()
+	if err != nil {
+		writeError(w, 500, "failed to generate webhook secret")
+		return
+	}
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, 500, "failed to rotate webhook secret")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	qtx := h.Queries.WithTx(tx)
+	connector, err := qtx.LockWebhookConnectorForConfiguration(r.Context(), db.LockWebhookConnectorForConfigurationParams{ID: connectorID, WorkspaceID: workspaceID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, 404, "connector not found")
+		return
+	}
+	if err != nil {
+		writeError(w, 500, "failed to rotate webhook secret")
+		return
+	}
+	if connector.ConnectorType != service.WebhookConnectorType || !webhookResultCapability(connector.Capabilities) {
+		writeError(w, 400, "connector must be a webhook with result_delivery capability")
+		return
+	}
+	row, err := qtx.RotateWorkbenchWebhookSecret(r.Context(), db.RotateWorkbenchWebhookSecretParams{ConnectorID: connectorID, WorkspaceID: workspaceID, SigningSecretEncrypted: encrypted, SigningSecretPrefix: prefix, UpdatedBy: member.UserID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusConflict, "webhook is not configured")
+		return
+	}
+	if err != nil {
+		writeError(w, 500, "failed to rotate webhook secret")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, 500, "failed to rotate webhook secret")
+		return
+	}
+	writeJSON(w, http.StatusOK, WebhookConfigurationResponse{Version: row.ConfigVersion, URL: row.EndpointUrl, TimeoutMS: row.TimeoutMs, SecretPrefix: row.SigningSecretPrefix, Secret: secret})
+}
+
+func (h *Handler) generateWebhookSecret() (string, []byte, string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", nil, "", err
+	}
+	secret := "mws_" + hex.EncodeToString(raw)
+	encrypted, err := h.WorkbenchSecretBox.Seal([]byte(secret))
+	if err != nil {
+		return "", nil, "", err
+	}
+	return secret, encrypted, secret[:12], nil
+}
+
+func webhookResultCapability(raw []byte) bool {
+	var caps map[string]any
+	if json.Unmarshal(raw, &caps) != nil {
+		return false
+	}
+	value, ok := caps[service.WebhookResultCapability].(bool)
+	return ok && value
 }
 
 func (h *Handler) ListConnectors(w http.ResponseWriter, r *http.Request) {

@@ -131,6 +131,7 @@ type RouterOptions struct {
 	// BatchedHeartbeatScheduler here so the caller can also drive Run/Stop;
 	// tests leave this nil and get the legacy synchronous behavior.
 	HeartbeatScheduler handler.HeartbeatScheduler
+	WorkbenchSecretBox *secretbox.Box
 }
 
 // NewRouterWithOptions builds the fully-configured Chi router and
@@ -180,6 +181,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		LLMDefaultModel:          strings.TrimSpace(os.Getenv("MULTICA_LLM_DEFAULT_MODEL")),
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
+	h.WorkbenchSecretBox = opts.WorkbenchSecretBox
 	h.Metrics = opts.BusinessMetrics
 	h.FeatureFlags = opts.FeatureFlags
 	h.TaskService.FeatureFlags = opts.FeatureFlags
@@ -1032,6 +1034,8 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				r.Post("/", h.CreateConnector)
 				r.Route("/{connectorId}", func(r chi.Router) {
 					r.Get("/", h.GetConnector)
+					r.Put("/webhook", h.ConfigureWebhookConnector)
+					r.Post("/webhook/rotate-secret", h.RotateWebhookConnectorSecret)
 					r.Post("/disable", h.DisableConnector)
 					r.Get("/issue-templates", h.ListConnectorIssueTemplateHistory)
 					r.Get("/issue-templates/active", h.ListConnectorActiveIssueTemplates)

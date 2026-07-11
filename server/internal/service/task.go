@@ -1806,6 +1806,13 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 		}
 		task = t
 
+		if _, err := qtx.EnqueueWorkbenchResult(ctx, db.EnqueueWorkbenchResultParams{
+			Outcome: "completed",
+			TaskID:  t.ID,
+		}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("enqueue workbench result: %w", err)
+		}
+
 		if t.ChatSessionID.Valid {
 			// Pin the chat_session's runtime_id alongside the session_id so the
 			// next claim can apply the runtime-guard. Both fields move together:
@@ -1994,6 +2001,15 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 			return err
 		}
 		task = t
+
+		if !retryableReasons[failureReason] || t.Attempt >= t.MaxAttempts {
+			if _, err := qtx.EnqueueWorkbenchResult(ctx, db.EnqueueWorkbenchResultParams{
+				Outcome: "failed",
+				TaskID:  t.ID,
+			}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return fmt.Errorf("enqueue workbench result: %w", err)
+			}
+		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but
 		// do not promote them to the chat-level resume pointer.

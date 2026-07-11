@@ -1,11 +1,52 @@
 package main
 
 import (
+	"encoding/base64"
+	"errors"
 	"os"
+	"strings"
 	"testing"
 
+	"github.com/multica-ai/multica/server/internal/util/secretbox"
 	"github.com/redis/go-redis/v9"
 )
+
+func TestLoadWorkbenchSecretBox(t *testing.T) {
+	valid := base64.StdEncoding.EncodeToString(make([]byte, secretbox.KeySize))
+	for _, tc := range []struct {
+		name       string
+		value      string
+		present    bool
+		newErr     error
+		configured bool
+		wantErr    bool
+	}{
+		{name: "unset disables", present: false},
+		{name: "empty present is invalid", present: true, wantErr: true, configured: true},
+		{name: "invalid base64", value: "%%%", present: true, wantErr: true, configured: true},
+		{name: "wrong length", value: base64.StdEncoding.EncodeToString([]byte("short")), present: true, wantErr: true, configured: true},
+		{name: "secretbox init failure", value: valid, present: true, newErr: errors.New("init failed"), wantErr: true, configured: true},
+		{name: "valid", value: valid, present: true, configured: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			box, configured, err := loadWorkbenchSecretBox(func(string) (string, bool) { return tc.value, tc.present }, func(key []byte) (*secretbox.Box, error) {
+				if tc.newErr != nil {
+					return nil, tc.newErr
+				}
+				return secretbox.New(key)
+			})
+			if configured != tc.configured || (err != nil) != tc.wantErr {
+				t.Fatalf("configured=%v err=%v", configured, err)
+			}
+			if !tc.wantErr && tc.present && box == nil {
+				t.Fatal("valid configured key returned nil box")
+			}
+			if err != nil && tc.value != "" && strings.Contains(err.Error(), tc.value) {
+				t.Fatal("error leaked key content")
+			}
+		})
+	}
+}
 
 func TestRedisClientName(t *testing.T) {
 	tests := []struct {
