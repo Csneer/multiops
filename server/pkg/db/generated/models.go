@@ -398,6 +398,23 @@ type DaemonToken struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type ExternalRecord struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	SourceType    string             `json:"source_type"`
+	ExternalID    string             `json:"external_id"`
+	ExternalKey   pgtype.Text        `json:"external_key"`
+	Title         string             `json:"title"`
+	Summary       pgtype.Text        `json:"summary"`
+	SourceStatus  pgtype.Text        `json:"source_status"`
+	SourceUrl     pgtype.Text        `json:"source_url"`
+	SchemaVersion string             `json:"schema_version"`
+	RawPayloadRef pgtype.Text        `json:"raw_payload_ref"`
+	LastSeenAt    pgtype.Timestamptz `json:"last_seen_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
 type Feedback struct {
 	ID          pgtype.UUID        `json:"id"`
 	UserID      pgtype.UUID        `json:"user_id"`
@@ -497,6 +514,21 @@ type InboxItem struct {
 	Details       []byte             `json:"details"`
 }
 
+type IntegrationIngestAttempt struct {
+	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	SourceType       string             `json:"source_type"`
+	IdempotencyKey   string             `json:"idempotency_key"`
+	ExternalRecordID pgtype.UUID        `json:"external_record_id"`
+	IssueID          pgtype.UUID        `json:"issue_id"`
+	Outcome          string             `json:"outcome"`
+	ErrorSummary     pgtype.Text        `json:"error_summary"`
+	AttemptCount     int32              `json:"attempt_count"`
+	ObservedAt       pgtype.Timestamptz `json:"observed_at"`
+	LastAttemptAt    pgtype.Timestamptz `json:"last_attempt_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type Issue struct {
 	ID                 pgtype.UUID        `json:"id"`
 	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
@@ -530,6 +562,15 @@ type IssueDependency struct {
 	IssueID          pgtype.UUID `json:"issue_id"`
 	DependsOnIssueID pgtype.UUID `json:"depends_on_issue_id"`
 	Type             string      `json:"type"`
+}
+
+type IssueExternalRecordBinding struct {
+	ID               pgtype.UUID        `json:"id"`
+	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
+	IssueID          pgtype.UUID        `json:"issue_id"`
+	ExternalRecordID pgtype.UUID        `json:"external_record_id"`
+	BindingRole      string             `json:"binding_role"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 }
 
 type IssueLabel struct {

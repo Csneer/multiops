@@ -1015,11 +1015,15 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/labels", h.AttachLabel)
 					r.Delete("/labels/{labelId}", h.DetachLabel)
 					r.Get("/metadata", h.ListIssueMetadata)
+					r.Get("/external-records", h.ListIssueExternalRecords)
 					r.Put("/metadata/{key}", h.SetIssueMetadataKey)
 					r.Delete("/metadata/{key}", h.DeleteIssueMetadataKey)
 					r.Get("/pull-requests", h.ListPullRequestsForIssue)
 				})
 			})
+
+			// Workbench Phase 1 integration ingress.
+			r.Post("/api/integrations/ingest", h.IngestExternalRecord)
 
 			// Task messages (user-facing, not daemon auth)
 			r.Get("/api/tasks/{taskId}/messages", h.ListTaskMessagesByUser)
