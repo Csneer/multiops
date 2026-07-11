@@ -15,19 +15,25 @@ const completeIntegrationIngestAttempt = `-- name: CompleteIntegrationIngestAtte
 UPDATE integration_ingest_attempt
 SET external_record_id = $2,
     issue_id = $4,
+    connector_id = $5,
+    issue_template_id = $6,
+    issue_template_version = $7,
     outcome = $3,
-    error_summary = $5,
+    error_summary = $8,
     last_attempt_at = now()
 WHERE id = $1
-RETURNING id, workspace_id, source_type, idempotency_key, external_record_id, issue_id, outcome, error_summary, attempt_count, observed_at, last_attempt_at, created_at
+RETURNING id, workspace_id, source_type, idempotency_key, external_record_id, issue_id, outcome, error_summary, attempt_count, observed_at, last_attempt_at, created_at, connector_id, issue_template_id, issue_template_version, request_fingerprint
 `
 
 type CompleteIntegrationIngestAttemptParams struct {
-	ID               pgtype.UUID `json:"id"`
-	ExternalRecordID pgtype.UUID `json:"external_record_id"`
-	Outcome          string      `json:"outcome"`
-	IssueID          pgtype.UUID `json:"issue_id"`
-	ErrorSummary     pgtype.Text `json:"error_summary"`
+	ID                   pgtype.UUID `json:"id"`
+	ExternalRecordID     pgtype.UUID `json:"external_record_id"`
+	Outcome              string      `json:"outcome"`
+	IssueID              pgtype.UUID `json:"issue_id"`
+	ConnectorID          pgtype.UUID `json:"connector_id"`
+	IssueTemplateID      pgtype.UUID `json:"issue_template_id"`
+	IssueTemplateVersion pgtype.Int4 `json:"issue_template_version"`
+	ErrorSummary         pgtype.Text `json:"error_summary"`
 }
 
 func (q *Queries) CompleteIntegrationIngestAttempt(ctx context.Context, arg CompleteIntegrationIngestAttemptParams) (IntegrationIngestAttempt, error) {
@@ -36,6 +42,9 @@ func (q *Queries) CompleteIntegrationIngestAttempt(ctx context.Context, arg Comp
 		arg.ExternalRecordID,
 		arg.Outcome,
 		arg.IssueID,
+		arg.ConnectorID,
+		arg.IssueTemplateID,
+		arg.IssueTemplateVersion,
 		arg.ErrorSummary,
 	)
 	var i IntegrationIngestAttempt
@@ -52,6 +61,60 @@ func (q *Queries) CompleteIntegrationIngestAttempt(ctx context.Context, arg Comp
 		&i.ObservedAt,
 		&i.LastAttemptAt,
 		&i.CreatedAt,
+		&i.ConnectorID,
+		&i.IssueTemplateID,
+		&i.IssueTemplateVersion,
+		&i.RequestFingerprint,
+	)
+	return i, err
+}
+
+const createConnectorInstance = `-- name: CreateConnectorInstance :one
+
+INSERT INTO connector_instance (
+    workspace_id, key, name, connector_type, capabilities, config, enabled, created_by
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, workspace_id, key, name, connector_type, capabilities, config, enabled, created_by, created_at, updated_at
+`
+
+type CreateConnectorInstanceParams struct {
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
+	Key           string      `json:"key"`
+	Name          string      `json:"name"`
+	ConnectorType string      `json:"connector_type"`
+	Capabilities  []byte      `json:"capabilities"`
+	Config        []byte      `json:"config"`
+	Enabled       bool        `json:"enabled"`
+	CreatedBy     pgtype.UUID `json:"created_by"`
+}
+
+// =====================
+// Workbench
+// =====================
+func (q *Queries) CreateConnectorInstance(ctx context.Context, arg CreateConnectorInstanceParams) (ConnectorInstance, error) {
+	row := q.db.QueryRow(ctx, createConnectorInstance,
+		arg.WorkspaceID,
+		arg.Key,
+		arg.Name,
+		arg.ConnectorType,
+		arg.Capabilities,
+		arg.Config,
+		arg.Enabled,
+		arg.CreatedBy,
+	)
+	var i ConnectorInstance
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Key,
+		&i.Name,
+		&i.ConnectorType,
+		&i.Capabilities,
+		&i.Config,
+		&i.Enabled,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
 	)
 	return i, err
 }
@@ -99,8 +162,134 @@ func (q *Queries) CreateIssueExternalRecordBinding(ctx context.Context, arg Crea
 	return i, err
 }
 
+const createIssueTemplate = `-- name: CreateIssueTemplate :one
+INSERT INTO issue_template (
+    workspace_id, connector_id, template_key, version, name, enabled, priority,
+    match_source_status, match_labels_any, match_fields, title_prefix,
+    description_source, status, issue_priority, assignee_type, assignee_id,
+    auto_start, created_by
+) VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $16, $8, $9,
+    $10, $11, $12, $13, $17, $18, $14, $15
+)
+RETURNING id, workspace_id, connector_id, template_key, version, name, enabled, priority, match_source_status, match_labels_any, match_fields, title_prefix, description_source, status, issue_priority, assignee_type, assignee_id, auto_start, created_by, created_at
+`
+
+type CreateIssueTemplateParams struct {
+	WorkspaceID       pgtype.UUID `json:"workspace_id"`
+	ConnectorID       pgtype.UUID `json:"connector_id"`
+	TemplateKey       string      `json:"template_key"`
+	Version           int32       `json:"version"`
+	Name              string      `json:"name"`
+	Enabled           bool        `json:"enabled"`
+	Priority          int32       `json:"priority"`
+	MatchLabelsAny    []string    `json:"match_labels_any"`
+	MatchFields       []byte      `json:"match_fields"`
+	TitlePrefix       string      `json:"title_prefix"`
+	DescriptionSource string      `json:"description_source"`
+	Status            string      `json:"status"`
+	IssuePriority     string      `json:"issue_priority"`
+	AutoStart         bool        `json:"auto_start"`
+	CreatedBy         pgtype.UUID `json:"created_by"`
+	MatchSourceStatus pgtype.Text `json:"match_source_status"`
+	AssigneeType      pgtype.Text `json:"assignee_type"`
+	AssigneeID        pgtype.UUID `json:"assignee_id"`
+}
+
+func (q *Queries) CreateIssueTemplate(ctx context.Context, arg CreateIssueTemplateParams) (IssueTemplate, error) {
+	row := q.db.QueryRow(ctx, createIssueTemplate,
+		arg.WorkspaceID,
+		arg.ConnectorID,
+		arg.TemplateKey,
+		arg.Version,
+		arg.Name,
+		arg.Enabled,
+		arg.Priority,
+		arg.MatchLabelsAny,
+		arg.MatchFields,
+		arg.TitlePrefix,
+		arg.DescriptionSource,
+		arg.Status,
+		arg.IssuePriority,
+		arg.AutoStart,
+		arg.CreatedBy,
+		arg.MatchSourceStatus,
+		arg.AssigneeType,
+		arg.AssigneeID,
+	)
+	var i IssueTemplate
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ConnectorID,
+		&i.TemplateKey,
+		&i.Version,
+		&i.Name,
+		&i.Enabled,
+		&i.Priority,
+		&i.MatchSourceStatus,
+		&i.MatchLabelsAny,
+		&i.MatchFields,
+		&i.TitlePrefix,
+		&i.DescriptionSource,
+		&i.Status,
+		&i.IssuePriority,
+		&i.AssigneeType,
+		&i.AssigneeID,
+		&i.AutoStart,
+		&i.CreatedBy,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const disableEnabledIssueTemplate = `-- name: DisableEnabledIssueTemplate :exec
+UPDATE issue_template SET enabled = false
+WHERE workspace_id = $1 AND connector_id = $2 AND template_key = $3 AND enabled
+`
+
+type DisableEnabledIssueTemplateParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+	TemplateKey string      `json:"template_key"`
+}
+
+func (q *Queries) DisableEnabledIssueTemplate(ctx context.Context, arg DisableEnabledIssueTemplateParams) error {
+	_, err := q.db.Exec(ctx, disableEnabledIssueTemplate, arg.WorkspaceID, arg.ConnectorID, arg.TemplateKey)
+	return err
+}
+
+const getEnabledConnectorInWorkspace = `-- name: GetEnabledConnectorInWorkspace :one
+SELECT id, workspace_id, key, name, connector_type, capabilities, config, enabled, created_by, created_at, updated_at FROM connector_instance
+WHERE id = $1 AND workspace_id = $2 AND enabled
+`
+
+type GetEnabledConnectorInWorkspaceParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) GetEnabledConnectorInWorkspace(ctx context.Context, arg GetEnabledConnectorInWorkspaceParams) (ConnectorInstance, error) {
+	row := q.db.QueryRow(ctx, getEnabledConnectorInWorkspace, arg.ID, arg.WorkspaceID)
+	var i ConnectorInstance
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Key,
+		&i.Name,
+		&i.ConnectorType,
+		&i.Capabilities,
+		&i.Config,
+		&i.Enabled,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getExternalRecordInWorkspace = `-- name: GetExternalRecordInWorkspace :one
-SELECT id, workspace_id, source_type, external_id, external_key, title, summary, source_status, source_url, schema_version, raw_payload_ref, last_seen_at, created_at, updated_at FROM external_record
+SELECT id, workspace_id, source_type, external_id, external_key, title, summary, source_status, source_url, schema_version, raw_payload_ref, last_seen_at, created_at, updated_at, connector_id, labels, fields FROM external_record
 WHERE id = $1
   AND workspace_id = $2
 `
@@ -128,12 +317,15 @@ func (q *Queries) GetExternalRecordInWorkspace(ctx context.Context, arg GetExter
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ConnectorID,
+		&i.Labels,
+		&i.Fields,
 	)
 	return i, err
 }
 
 const getIntegrationIngestAttempt = `-- name: GetIntegrationIngestAttempt :one
-SELECT id, workspace_id, source_type, idempotency_key, external_record_id, issue_id, outcome, error_summary, attempt_count, observed_at, last_attempt_at, created_at FROM integration_ingest_attempt
+SELECT id, workspace_id, source_type, idempotency_key, external_record_id, issue_id, outcome, error_summary, attempt_count, observed_at, last_attempt_at, created_at, connector_id, issue_template_id, issue_template_version, request_fingerprint FROM integration_ingest_attempt
 WHERE workspace_id = $1
   AND source_type = $2
   AND idempotency_key = $3
@@ -161,8 +353,31 @@ func (q *Queries) GetIntegrationIngestAttempt(ctx context.Context, arg GetIntegr
 		&i.ObservedAt,
 		&i.LastAttemptAt,
 		&i.CreatedAt,
+		&i.ConnectorID,
+		&i.IssueTemplateID,
+		&i.IssueTemplateVersion,
+		&i.RequestFingerprint,
 	)
 	return i, err
+}
+
+const getNextIssueTemplateVersion = `-- name: GetNextIssueTemplateVersion :one
+SELECT COALESCE(MAX(version), 0)::int + 1 AS version
+FROM issue_template
+WHERE workspace_id = $1 AND connector_id = $2 AND template_key = $3
+`
+
+type GetNextIssueTemplateVersionParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	ConnectorID pgtype.UUID `json:"connector_id"`
+	TemplateKey string      `json:"template_key"`
+}
+
+func (q *Queries) GetNextIssueTemplateVersion(ctx context.Context, arg GetNextIssueTemplateVersionParams) (int32, error) {
+	row := q.db.QueryRow(ctx, getNextIssueTemplateVersion, arg.WorkspaceID, arg.ConnectorID, arg.TemplateKey)
+	var version int32
+	err := row.Scan(&version)
+	return version, err
 }
 
 const hasAnyTaskHistoryForIssue = `-- name: HasAnyTaskHistoryForIssue :one
@@ -184,6 +399,7 @@ SELECT
     b.binding_role,
     b.created_at AS bound_at,
     r.id AS external_record_id,
+    r.connector_id,
     r.source_type,
     r.external_id,
     r.external_key,
@@ -192,6 +408,8 @@ SELECT
     r.source_status,
     r.source_url,
     r.schema_version,
+    r.labels,
+    r.fields,
     r.last_seen_at
 FROM issue_external_record_binding b
 JOIN external_record r ON r.id = b.external_record_id
@@ -210,6 +428,7 @@ type ListIssueExternalRecordBindingsRow struct {
 	BindingRole      string             `json:"binding_role"`
 	BoundAt          pgtype.Timestamptz `json:"bound_at"`
 	ExternalRecordID pgtype.UUID        `json:"external_record_id"`
+	ConnectorID      pgtype.UUID        `json:"connector_id"`
 	SourceType       string             `json:"source_type"`
 	ExternalID       string             `json:"external_id"`
 	ExternalKey      pgtype.Text        `json:"external_key"`
@@ -218,6 +437,8 @@ type ListIssueExternalRecordBindingsRow struct {
 	SourceStatus     pgtype.Text        `json:"source_status"`
 	SourceUrl        pgtype.Text        `json:"source_url"`
 	SchemaVersion    string             `json:"schema_version"`
+	Labels           []string           `json:"labels"`
+	Fields           []byte             `json:"fields"`
 	LastSeenAt       pgtype.Timestamptz `json:"last_seen_at"`
 }
 
@@ -235,6 +456,7 @@ func (q *Queries) ListIssueExternalRecordBindings(ctx context.Context, arg ListI
 			&i.BindingRole,
 			&i.BoundAt,
 			&i.ExternalRecordID,
+			&i.ConnectorID,
 			&i.SourceType,
 			&i.ExternalID,
 			&i.ExternalKey,
@@ -243,6 +465,8 @@ func (q *Queries) ListIssueExternalRecordBindings(ctx context.Context, arg ListI
 			&i.SourceStatus,
 			&i.SourceUrl,
 			&i.SchemaVersion,
+			&i.Labels,
+			&i.Fields,
 			&i.LastSeenAt,
 		); err != nil {
 			return nil, err
@@ -253,6 +477,53 @@ func (q *Queries) ListIssueExternalRecordBindings(ctx context.Context, arg ListI
 		return nil, err
 	}
 	return items, nil
+}
+
+const lockConnectorTemplateKey = `-- name: LockConnectorTemplateKey :exec
+SELECT pg_advisory_xact_lock(hashtextextended(
+    $1::text || ':' || $2::text || ':' || $3, 0
+))
+`
+
+type LockConnectorTemplateKeyParams struct {
+	WorkspaceID string      `json:"workspace_id"`
+	ConnectorID string      `json:"connector_id"`
+	TemplateKey pgtype.Text `json:"template_key"`
+}
+
+func (q *Queries) LockConnectorTemplateKey(ctx context.Context, arg LockConnectorTemplateKeyParams) error {
+	_, err := q.db.Exec(ctx, lockConnectorTemplateKey, arg.WorkspaceID, arg.ConnectorID, arg.TemplateKey)
+	return err
+}
+
+const lockEnabledConnectorForRouting = `-- name: LockEnabledConnectorForRouting :one
+SELECT id, workspace_id, key, name, connector_type, capabilities, config, enabled, created_by, created_at, updated_at FROM connector_instance
+WHERE id = $1 AND workspace_id = $2 AND enabled
+FOR UPDATE
+`
+
+type LockEnabledConnectorForRoutingParams struct {
+	ID          pgtype.UUID `json:"id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
+
+func (q *Queries) LockEnabledConnectorForRouting(ctx context.Context, arg LockEnabledConnectorForRoutingParams) (ConnectorInstance, error) {
+	row := q.db.QueryRow(ctx, lockEnabledConnectorForRouting, arg.ID, arg.WorkspaceID)
+	var i ConnectorInstance
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Key,
+		&i.Name,
+		&i.ConnectorType,
+		&i.Capabilities,
+		&i.Config,
+		&i.Enabled,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const lockIssueForNeverEnqueuedReconciliation = `-- name: LockIssueForNeverEnqueuedReconciliation :one
@@ -304,44 +575,47 @@ func (q *Queries) LockIssueForNeverEnqueuedReconciliation(ctx context.Context, a
 }
 
 const recordOrBumpIntegrationIngestAttempt = `-- name: RecordOrBumpIntegrationIngestAttempt :one
-
 INSERT INTO integration_ingest_attempt (
-    workspace_id, source_type, idempotency_key, outcome, observed_at
+    workspace_id, source_type, idempotency_key, connector_id, request_fingerprint,
+    outcome, observed_at
 ) VALUES (
-    $1, $2, $3, 'processing', $4
+    $1, $2, $3, $5, $4, 'processing', $6
 )
-ON CONFLICT (workspace_id, source_type, idempotency_key) DO UPDATE
+ON CONFLICT (workspace_id, connector_id, source_type, idempotency_key) DO UPDATE
 SET attempt_count = integration_ingest_attempt.attempt_count + 1,
     last_attempt_at = now()
-RETURNING id, workspace_id, source_type, idempotency_key, external_record_id, issue_id, outcome, error_summary, attempt_count, observed_at, last_attempt_at, created_at, (xmax = 0) AS inserted
+RETURNING id, workspace_id, source_type, idempotency_key, external_record_id, issue_id, outcome, error_summary, attempt_count, observed_at, last_attempt_at, created_at, connector_id, issue_template_id, issue_template_version, request_fingerprint, (xmax = 0) AS inserted
 `
 
 type RecordOrBumpIntegrationIngestAttemptParams struct {
-	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
-	SourceType     string             `json:"source_type"`
-	IdempotencyKey string             `json:"idempotency_key"`
-	ObservedAt     pgtype.Timestamptz `json:"observed_at"`
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	SourceType         string             `json:"source_type"`
+	IdempotencyKey     string             `json:"idempotency_key"`
+	RequestFingerprint string             `json:"request_fingerprint"`
+	ConnectorID        pgtype.UUID        `json:"connector_id"`
+	ObservedAt         pgtype.Timestamptz `json:"observed_at"`
 }
 
 type RecordOrBumpIntegrationIngestAttemptRow struct {
-	ID               pgtype.UUID        `json:"id"`
-	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
-	SourceType       string             `json:"source_type"`
-	IdempotencyKey   string             `json:"idempotency_key"`
-	ExternalRecordID pgtype.UUID        `json:"external_record_id"`
-	IssueID          pgtype.UUID        `json:"issue_id"`
-	Outcome          string             `json:"outcome"`
-	ErrorSummary     pgtype.Text        `json:"error_summary"`
-	AttemptCount     int32              `json:"attempt_count"`
-	ObservedAt       pgtype.Timestamptz `json:"observed_at"`
-	LastAttemptAt    pgtype.Timestamptz `json:"last_attempt_at"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	Inserted         bool               `json:"inserted"`
+	ID                   pgtype.UUID        `json:"id"`
+	WorkspaceID          pgtype.UUID        `json:"workspace_id"`
+	SourceType           string             `json:"source_type"`
+	IdempotencyKey       string             `json:"idempotency_key"`
+	ExternalRecordID     pgtype.UUID        `json:"external_record_id"`
+	IssueID              pgtype.UUID        `json:"issue_id"`
+	Outcome              string             `json:"outcome"`
+	ErrorSummary         pgtype.Text        `json:"error_summary"`
+	AttemptCount         int32              `json:"attempt_count"`
+	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
+	LastAttemptAt        pgtype.Timestamptz `json:"last_attempt_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	ConnectorID          pgtype.UUID        `json:"connector_id"`
+	IssueTemplateID      pgtype.UUID        `json:"issue_template_id"`
+	IssueTemplateVersion pgtype.Int4        `json:"issue_template_version"`
+	RequestFingerprint   string             `json:"request_fingerprint"`
+	Inserted             bool               `json:"inserted"`
 }
 
-// =====================
-// Workbench Phase 1
-// =====================
 // Atomically claims an idempotency key or records another receipt of an
 // existing key. The original outcome and links remain authoritative; callers
 // use inserted=false to return a deterministic duplicate result without
@@ -351,6 +625,8 @@ func (q *Queries) RecordOrBumpIntegrationIngestAttempt(ctx context.Context, arg 
 		arg.WorkspaceID,
 		arg.SourceType,
 		arg.IdempotencyKey,
+		arg.RequestFingerprint,
+		arg.ConnectorID,
 		arg.ObservedAt,
 	)
 	var i RecordOrBumpIntegrationIngestAttemptRow
@@ -367,31 +643,92 @@ func (q *Queries) RecordOrBumpIntegrationIngestAttempt(ctx context.Context, arg 
 		&i.ObservedAt,
 		&i.LastAttemptAt,
 		&i.CreatedAt,
+		&i.ConnectorID,
+		&i.IssueTemplateID,
+		&i.IssueTemplateVersion,
+		&i.RequestFingerprint,
 		&i.Inserted,
+	)
+	return i, err
+}
+
+const selectMatchingIssueTemplate = `-- name: SelectMatchingIssueTemplate :one
+SELECT id, workspace_id, connector_id, template_key, version, name, enabled, priority, match_source_status, match_labels_any, match_fields, title_prefix, description_source, status, issue_priority, assignee_type, assignee_id, auto_start, created_by, created_at FROM issue_template
+WHERE workspace_id = $1
+  AND connector_id = $2
+  AND enabled
+  AND (match_source_status IS NULL OR match_source_status = $3)
+  AND (cardinality(match_labels_any) = 0 OR match_labels_any && $4::text[])
+  AND match_fields <@ $5::jsonb
+ORDER BY priority DESC, id ASC
+LIMIT 1
+`
+
+type SelectMatchingIssueTemplateParams struct {
+	WorkspaceID  pgtype.UUID `json:"workspace_id"`
+	ConnectorID  pgtype.UUID `json:"connector_id"`
+	SourceStatus pgtype.Text `json:"source_status"`
+	Labels       []string    `json:"labels"`
+	Fields       []byte      `json:"fields"`
+}
+
+func (q *Queries) SelectMatchingIssueTemplate(ctx context.Context, arg SelectMatchingIssueTemplateParams) (IssueTemplate, error) {
+	row := q.db.QueryRow(ctx, selectMatchingIssueTemplate,
+		arg.WorkspaceID,
+		arg.ConnectorID,
+		arg.SourceStatus,
+		arg.Labels,
+		arg.Fields,
+	)
+	var i IssueTemplate
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.ConnectorID,
+		&i.TemplateKey,
+		&i.Version,
+		&i.Name,
+		&i.Enabled,
+		&i.Priority,
+		&i.MatchSourceStatus,
+		&i.MatchLabelsAny,
+		&i.MatchFields,
+		&i.TitlePrefix,
+		&i.DescriptionSource,
+		&i.Status,
+		&i.IssuePriority,
+		&i.AssigneeType,
+		&i.AssigneeID,
+		&i.AutoStart,
+		&i.CreatedBy,
+		&i.CreatedAt,
 	)
 	return i, err
 }
 
 const upsertExternalRecord = `-- name: UpsertExternalRecord :one
 INSERT INTO external_record (
-    workspace_id, source_type, external_id, external_key, title, summary,
-    source_status, source_url, schema_version, raw_payload_ref, last_seen_at
+    workspace_id, source_type, external_id, connector_id, external_key, title, summary,
+    source_status, source_url, schema_version, raw_payload_ref, labels, fields, last_seen_at
 ) VALUES (
-    $1, $2, $3, $6, $4, $7,
-    $8, $9, $5,
-    $10, $11
+    $1, $2, $3, $8, $9, $4, $10,
+    $11, $12, $5,
+    $13, $6, $7, $14
 )
-ON CONFLICT (workspace_id, source_type, external_id) DO UPDATE
-SET external_key = EXCLUDED.external_key,
+ON CONFLICT (workspace_id, connector_id, source_type, external_id) DO UPDATE
+SET connector_id = EXCLUDED.connector_id,
+    external_key = EXCLUDED.external_key,
     title = EXCLUDED.title,
     summary = EXCLUDED.summary,
     source_status = EXCLUDED.source_status,
     source_url = EXCLUDED.source_url,
     schema_version = EXCLUDED.schema_version,
     raw_payload_ref = EXCLUDED.raw_payload_ref,
+    labels = EXCLUDED.labels,
+    fields = EXCLUDED.fields,
     last_seen_at = EXCLUDED.last_seen_at,
     updated_at = now()
-RETURNING id, workspace_id, source_type, external_id, external_key, title, summary, source_status, source_url, schema_version, raw_payload_ref, last_seen_at, created_at, updated_at, (xmax = 0) AS inserted
+RETURNING id, workspace_id, source_type, external_id, external_key, title, summary, source_status, source_url, schema_version, raw_payload_ref, last_seen_at, created_at, updated_at, connector_id, labels, fields, (xmax = 0) AS inserted
 `
 
 type UpsertExternalRecordParams struct {
@@ -400,6 +737,9 @@ type UpsertExternalRecordParams struct {
 	ExternalID    string             `json:"external_id"`
 	Title         string             `json:"title"`
 	SchemaVersion string             `json:"schema_version"`
+	Labels        []string           `json:"labels"`
+	Fields        []byte             `json:"fields"`
+	ConnectorID   pgtype.UUID        `json:"connector_id"`
 	ExternalKey   pgtype.Text        `json:"external_key"`
 	Summary       pgtype.Text        `json:"summary"`
 	SourceStatus  pgtype.Text        `json:"source_status"`
@@ -423,6 +763,9 @@ type UpsertExternalRecordRow struct {
 	LastSeenAt    pgtype.Timestamptz `json:"last_seen_at"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	ConnectorID   pgtype.UUID        `json:"connector_id"`
+	Labels        []string           `json:"labels"`
+	Fields        []byte             `json:"fields"`
 	Inserted      bool               `json:"inserted"`
 }
 
@@ -433,6 +776,9 @@ func (q *Queries) UpsertExternalRecord(ctx context.Context, arg UpsertExternalRe
 		arg.ExternalID,
 		arg.Title,
 		arg.SchemaVersion,
+		arg.Labels,
+		arg.Fields,
+		arg.ConnectorID,
 		arg.ExternalKey,
 		arg.Summary,
 		arg.SourceStatus,
@@ -456,6 +802,9 @@ func (q *Queries) UpsertExternalRecord(ctx context.Context, arg UpsertExternalRe
 		&i.LastSeenAt,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ConnectorID,
+		&i.Labels,
+		&i.Fields,
 		&i.Inserted,
 	)
 	return i, err

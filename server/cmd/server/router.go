@@ -1022,7 +1022,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 				})
 			})
 
-			// Workbench Phase 1 integration ingress.
+			// Workbench connector configuration and integration ingress.
+			r.Post("/api/connectors", h.CreateConnector)
+			r.Post("/api/issue-templates", h.CreateIssueTemplate)
 			r.Post("/api/integrations/ingest", h.IngestExternalRecord)
 
 			// Task messages (user-facing, not daemon auth)

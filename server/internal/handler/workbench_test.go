@@ -301,6 +301,19 @@ func TestIngestExternalRecordUpdatesIdentityAndAuditsDuplicateReceipt(t *testing
 	if duplicate.Outcome != "duplicate" || duplicate.AttemptCount != 2 {
 		t.Fatalf("duplicate result = %+v, want duplicate with attempt_count 2", duplicate)
 	}
+	if _, err := testPool.Exec(context.Background(), `
+		UPDATE integration_ingest_attempt
+		SET request_fingerprint = ''
+		WHERE workspace_id = $1 AND source_type = 'ferry' AND idempotency_key = 'ingest-5662-a'
+	`, testWorkspaceID); err != nil {
+		t.Fatalf("simulate legacy ingest attempt: %v", err)
+	}
+	w = httptest.NewRecorder()
+	req = newRequest(http.MethodPost, "/api/integrations/ingest", first)
+	testHandler.IngestExternalRecord(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("legacy duplicate ingest: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
 
 	updated := workbenchIngestBody("ferry", "work-order-5662", "Updated title", "ingest-5662-b", issueID)
 	updated["summary"] = "Updated snapshot"
@@ -328,7 +341,7 @@ func TestIngestExternalRecordUpdatesIdentityAndAuditsDuplicateReceipt(t *testing
 	`, testWorkspaceID, issueID).Scan(&recordCount, &bindingCount, &attemptCount, &retryCount); err != nil {
 		t.Fatalf("load ingest audit rows: %v", err)
 	}
-	if recordCount != 1 || bindingCount != 1 || attemptCount != 1 || retryCount != 2 {
+	if recordCount != 1 || bindingCount != 1 || attemptCount != 1 || retryCount != 3 {
 		t.Fatalf("counts record=%d binding=%d attempt=%d retry=%d", recordCount, bindingCount, attemptCount, retryCount)
 	}
 }
@@ -401,5 +414,186 @@ func workbenchIngestBody(sourceType, externalID, title, idempotencyKey, issueID 
 		"schema_version":  "v1",
 		"idempotency_key": idempotencyKey,
 		"issue_id":        issueID,
+	}
+}
+
+func createWorkbenchConnector(t *testing.T, key, connectorType string) string {
+	t.Helper()
+	w := httptest.NewRecorder()
+	testHandler.CreateConnector(w, newRequest(http.MethodPost, "/api/connectors", map[string]any{"key": key, "name": key, "type": connectorType}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create connector: %d %s", w.Code, w.Body.String())
+	}
+	var row struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&row); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM connector_instance WHERE id=$1`, row.ID) })
+	return row.ID
+}
+
+func createWorkbenchTemplate(t *testing.T, connectorID, key string, priority int, output map[string]any, match map[string]any) map[string]any {
+	t.Helper()
+	w := httptest.NewRecorder()
+	testHandler.CreateIssueTemplate(w, newRequest(http.MethodPost, "/api/issue-templates", map[string]any{"connector_id": connectorID, "template_key": key, "name": key, "priority": priority, "match": match, "output": output}))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("create template: %d %s", w.Code, w.Body.String())
+	}
+	var row map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&row); err != nil {
+		t.Fatal(err)
+	}
+	return row
+}
+
+func TestWorkbenchConnectorAndTemplateVersions(t *testing.T) {
+	connectorID := createWorkbenchConnector(t, "versions", "ferry")
+	first := createWorkbenchTemplate(t, connectorID, "route", 1, map[string]any{"status": "todo"}, map[string]any{})
+	second := createWorkbenchTemplate(t, connectorID, "route", 2, map[string]any{"status": "todo"}, map[string]any{})
+	if first["version"] != float64(1) || second["version"] != float64(2) {
+		t.Fatalf("versions: %#v %#v", first, second)
+	}
+	var enabled int
+	if err := testPool.QueryRow(context.Background(), `SELECT count(*) FROM issue_template WHERE connector_id=$1 AND template_key='route' AND enabled`, connectorID).Scan(&enabled); err != nil {
+		t.Fatal(err)
+	}
+	if enabled != 1 {
+		t.Fatalf("enabled versions=%d", enabled)
+	}
+}
+
+func TestWorkbenchConnectorIngestRoutesAndDuplicates(t *testing.T) {
+	agentID := createHandlerTestAgent(t, "Workbench routed agent", nil)
+	connectorID := createWorkbenchConnector(t, "routing", "ferry")
+	createWorkbenchTemplate(t, connectorID, "fallback", 1, map[string]any{"title_prefix": "Low: ", "status": "todo"}, map[string]any{})
+	template := createWorkbenchTemplate(t, connectorID, "matched", 10, map[string]any{"title_prefix": "Routed: ", "description_source": "summary", "status": "in_progress", "priority": "high", "assignee_type": "agent", "assignee_id": agentID}, map[string]any{"source_status": "ready", "labels_any": []string{"urgent"}, "fields": map[string]any{"kind": "work"}})
+	body := workbenchIngestBody("ferry", "routed-1", "External title", "routed-key", "")
+	delete(body, "issue_id")
+	body["connector_id"] = connectorID
+	body["labels"] = []string{" urgent ", "urgent"}
+	body["fields"] = map[string]any{"kind": "work", "count": 2}
+	body["source_status"] = "ready"
+	w := httptest.NewRecorder()
+	testHandler.IngestExternalRecord(w, newRequest(http.MethodPost, "/api/integrations/ingest", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("ingest: %d %s", w.Code, w.Body.String())
+	}
+	var response IngestExternalRecordResponse
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.IssueID == nil || response.IssueTemplateID == nil || *response.IssueTemplateID != template["id"] || response.IssueTemplateVersion == nil || *response.IssueTemplateVersion != 1 {
+		t.Fatalf("response=%+v template=%v", response, template)
+	}
+	issueID := *response.IssueID
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM issue WHERE id=$1`, issueID) })
+	var title, description, status, priority string
+	var tasks int
+	if err := testPool.QueryRow(context.Background(), `SELECT title,description,status,priority,(SELECT count(*) FROM agent_task_queue WHERE issue_id=i.id) FROM issue i WHERE id=$1`, issueID).Scan(&title, &description, &status, &priority, &tasks); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Routed: External title" || description != "Synthetic Workbench test record" || status != "in_progress" || priority != "high" || tasks != 1 {
+		t.Fatalf("issue=%q %q %q %q tasks=%d", title, description, status, priority, tasks)
+	}
+	w = httptest.NewRecorder()
+	testHandler.IngestExternalRecord(w, newRequest(http.MethodPost, "/api/integrations/ingest", body))
+	if w.Code != http.StatusOK {
+		t.Fatalf("duplicate: %d %s", w.Code, w.Body.String())
+	}
+	var duplicate IngestExternalRecordResponse
+	json.NewDecoder(w.Body).Decode(&duplicate)
+	if duplicate.IssueTemplateID == nil || *duplicate.IssueTemplateID != *response.IssueTemplateID {
+		t.Fatalf("duplicate=%+v", duplicate)
+	}
+}
+
+func TestWorkbenchConnectorIdentityIsolationAndIdempotencyConflict(t *testing.T) {
+	firstConnector := createWorkbenchConnector(t, "identity-first", "ferry")
+	secondConnector := createWorkbenchConnector(t, "identity-second", "ferry")
+	createWorkbenchTemplate(t, firstConnector, "route", 1, map[string]any{"status": "todo"}, map[string]any{})
+	createWorkbenchTemplate(t, secondConnector, "route", 1, map[string]any{"status": "todo"}, map[string]any{})
+
+	ingest := func(connectorID, externalID string) *httptest.ResponseRecorder {
+		body := workbenchIngestBody("ferry", externalID, "Connector identity", "shared-key", "")
+		delete(body, "issue_id")
+		body["connector_id"] = connectorID
+		w := httptest.NewRecorder()
+		testHandler.IngestExternalRecord(w, newRequest(http.MethodPost, "/api/integrations/ingest", body))
+		return w
+	}
+
+	first := ingest(firstConnector, "shared-record")
+	if first.Code != http.StatusCreated {
+		t.Fatalf("first ingest: %d %s", first.Code, first.Body.String())
+	}
+	second := ingest(secondConnector, "shared-record")
+	if second.Code != http.StatusCreated {
+		t.Fatalf("second ingest: %d %s", second.Code, second.Body.String())
+	}
+	conflict := ingest(firstConnector, "different-record")
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("idempotency conflict: %d %s", conflict.Code, conflict.Body.String())
+	}
+	observedBody := workbenchIngestBody("ferry", "shared-record", "Connector identity", "shared-key", "")
+	delete(observedBody, "issue_id")
+	observedBody["connector_id"] = firstConnector
+	observedBody["observed_at"] = "2026-07-11T12:00:00Z"
+	observedConflict := httptest.NewRecorder()
+	testHandler.IngestExternalRecord(observedConflict, newRequest(http.MethodPost, "/api/integrations/ingest", observedBody))
+	if observedConflict.Code != http.StatusConflict {
+		t.Fatalf("observed_at conflict: %d %s", observedConflict.Code, observedConflict.Body.String())
+	}
+
+	var records, attempts int
+	if err := testPool.QueryRow(context.Background(), `
+		SELECT
+			(SELECT count(*) FROM external_record WHERE source_type='ferry' AND external_id='shared-record' AND connector_id IN ($1, $2)),
+			(SELECT count(*) FROM integration_ingest_attempt WHERE source_type='ferry' AND idempotency_key='shared-key' AND connector_id IN ($1, $2))
+	`, firstConnector, secondConnector).Scan(&records, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if records != 2 || attempts != 2 {
+		t.Fatalf("records=%d attempts=%d", records, attempts)
+	}
+}
+
+func TestWorkbenchConnectorIngestAutoStartFalseAndNoMatchRollback(t *testing.T) {
+	agentID := createHandlerTestAgent(t, "Workbench parked agent", nil)
+	connectorID := createWorkbenchConnector(t, "parked", "ferry")
+	createWorkbenchTemplate(t, connectorID, "park", 1, map[string]any{"status": "in_progress", "auto_start": false, "assignee_type": "agent", "assignee_id": agentID}, map[string]any{"source_status": "park"})
+	body := workbenchIngestBody("ferry", "parked-1", "Parked issue", "parked-key", "")
+	delete(body, "issue_id")
+	body["connector_id"] = connectorID
+	body["source_status"] = "park"
+	w := httptest.NewRecorder()
+	testHandler.IngestExternalRecord(w, newRequest(http.MethodPost, "/api/integrations/ingest", body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("park: %d %s", w.Code, w.Body.String())
+	}
+	var response IngestExternalRecordResponse
+	json.NewDecoder(w.Body).Decode(&response)
+	var status string
+	var tasks int
+	if err := testPool.QueryRow(context.Background(), `SELECT status,(SELECT count(*) FROM agent_task_queue WHERE issue_id=i.id) FROM issue i WHERE id=$1`, *response.IssueID).Scan(&status, &tasks); err != nil {
+		t.Fatal(err)
+	}
+	if status != "backlog" || tasks != 0 {
+		t.Fatalf("status=%s tasks=%d", status, tasks)
+	}
+	body = workbenchIngestBody("ferry", "no-match", "No match", "no-match-key", "")
+	delete(body, "issue_id")
+	body["connector_id"] = connectorID
+	body["source_status"] = "other"
+	w = httptest.NewRecorder()
+	testHandler.IngestExternalRecord(w, newRequest(http.MethodPost, "/api/integrations/ingest", body))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("no match: %d %s", w.Code, w.Body.String())
+	}
+	var records, attempts, issues int
+	testPool.QueryRow(context.Background(), `SELECT (SELECT count(*) FROM external_record WHERE external_id='no-match'),(SELECT count(*) FROM integration_ingest_attempt WHERE idempotency_key='no-match-key'),(SELECT count(*) FROM issue WHERE title='No match')`).Scan(&records, &attempts, &issues)
+	if records+attempts+issues != 0 {
+		t.Fatalf("rollback records=%d attempts=%d issues=%d", records, attempts, issues)
 	}
 }

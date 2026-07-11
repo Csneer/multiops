@@ -361,6 +361,20 @@ type CommentReaction struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type ConnectorInstance struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Key           string             `json:"key"`
+	Name          string             `json:"name"`
+	ConnectorType string             `json:"connector_type"`
+	Capabilities  []byte             `json:"capabilities"`
+	Config        []byte             `json:"config"`
+	Enabled       bool               `json:"enabled"`
+	CreatedBy     pgtype.UUID        `json:"created_by"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
 type ContactSalesInquiry struct {
 	ID              pgtype.UUID        `json:"id"`
 	FirstName       string             `json:"first_name"`
@@ -413,6 +427,9 @@ type ExternalRecord struct {
 	LastSeenAt    pgtype.Timestamptz `json:"last_seen_at"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+	ConnectorID   pgtype.UUID        `json:"connector_id"`
+	Labels        []string           `json:"labels"`
+	Fields        []byte             `json:"fields"`
 }
 
 type Feedback struct {
@@ -515,18 +532,22 @@ type InboxItem struct {
 }
 
 type IntegrationIngestAttempt struct {
-	ID               pgtype.UUID        `json:"id"`
-	WorkspaceID      pgtype.UUID        `json:"workspace_id"`
-	SourceType       string             `json:"source_type"`
-	IdempotencyKey   string             `json:"idempotency_key"`
-	ExternalRecordID pgtype.UUID        `json:"external_record_id"`
-	IssueID          pgtype.UUID        `json:"issue_id"`
-	Outcome          string             `json:"outcome"`
-	ErrorSummary     pgtype.Text        `json:"error_summary"`
-	AttemptCount     int32              `json:"attempt_count"`
-	ObservedAt       pgtype.Timestamptz `json:"observed_at"`
-	LastAttemptAt    pgtype.Timestamptz `json:"last_attempt_at"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	ID                   pgtype.UUID        `json:"id"`
+	WorkspaceID          pgtype.UUID        `json:"workspace_id"`
+	SourceType           string             `json:"source_type"`
+	IdempotencyKey       string             `json:"idempotency_key"`
+	ExternalRecordID     pgtype.UUID        `json:"external_record_id"`
+	IssueID              pgtype.UUID        `json:"issue_id"`
+	Outcome              string             `json:"outcome"`
+	ErrorSummary         pgtype.Text        `json:"error_summary"`
+	AttemptCount         int32              `json:"attempt_count"`
+	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
+	LastAttemptAt        pgtype.Timestamptz `json:"last_attempt_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	ConnectorID          pgtype.UUID        `json:"connector_id"`
+	IssueTemplateID      pgtype.UUID        `json:"issue_template_id"`
+	IssueTemplateVersion pgtype.Int4        `json:"issue_template_version"`
+	RequestFingerprint   string             `json:"request_fingerprint"`
 }
 
 type Issue struct {
@@ -608,6 +629,29 @@ type IssueSubscriber struct {
 	UserID    pgtype.UUID        `json:"user_id"`
 	Reason    string             `json:"reason"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+type IssueTemplate struct {
+	ID                pgtype.UUID        `json:"id"`
+	WorkspaceID       pgtype.UUID        `json:"workspace_id"`
+	ConnectorID       pgtype.UUID        `json:"connector_id"`
+	TemplateKey       string             `json:"template_key"`
+	Version           int32              `json:"version"`
+	Name              string             `json:"name"`
+	Enabled           bool               `json:"enabled"`
+	Priority          int32              `json:"priority"`
+	MatchSourceStatus pgtype.Text        `json:"match_source_status"`
+	MatchLabelsAny    []string           `json:"match_labels_any"`
+	MatchFields       []byte             `json:"match_fields"`
+	TitlePrefix       string             `json:"title_prefix"`
+	DescriptionSource string             `json:"description_source"`
+	Status            string             `json:"status"`
+	IssuePriority     string             `json:"issue_priority"`
+	AssigneeType      pgtype.Text        `json:"assignee_type"`
+	AssigneeID        pgtype.UUID        `json:"assignee_id"`
+	AutoStart         bool               `json:"auto_start"`
+	CreatedBy         pgtype.UUID        `json:"created_by"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
 }
 
 type IssueToLabel struct {
