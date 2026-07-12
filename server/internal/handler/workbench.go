@@ -3,11 +3,9 @@ package handler
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -25,9 +23,8 @@ import (
 )
 
 const (
-	maxWorkbenchTextLength     = 16 * 1024
-	workbenchPostCommitTimeout = 10 * time.Second
-	workbenchSystemActorID     = "00000000-0000-0000-0000-000000000000"
+	maxWorkbenchTextLength = 16 * 1024
+	workbenchSystemActorID = "00000000-0000-0000-0000-000000000000"
 )
 
 type CreateConnectorRequest struct {
@@ -1071,143 +1068,31 @@ func (h *Handler) ingestExternalRecord(w http.ResponseWriter, r *http.Request, m
 		writeError(w, 400, err.Error())
 		return
 	}
-	tx, err := h.TxStarter.Begin(r.Context())
-	if err != nil {
-		writeError(w, 500, "failed to start transaction")
-		return
-	}
-	defer tx.Rollback(r.Context())
-	qtx := h.Queries.WithTx(tx)
-	if connectorID.Valid {
-		connector, err := qtx.LockEnabledConnectorForRouting(r.Context(), db.LockEnabledConnectorForRoutingParams{ID: connectorID, WorkspaceID: workspaceID})
-		if errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusConflict, "connector changed during ingest")
-			return
-		}
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to lock connector")
-			return
-		}
-		if connector.ConnectorType != strings.TrimSpace(req.SourceType) {
-			writeError(w, http.StatusConflict, "connector changed during ingest")
-			return
-		}
+	ingest := service.NewWorkbenchIngestService(h.Queries, h.TxStarter, h.IssueService)
+	result, err := ingest.Ingest(r.Context(), service.WorkbenchIngestInput{WorkspaceID: workspaceID, ConnectorID: connectorID, CredentialID: credentialID, IssueID: issueID, CreatorID: parseUUID(creatorID), ActorID: func() string {
 		if machine {
-			if _, err := qtx.GetActiveConnectorCredentialForUpdate(r.Context(), db.GetActiveConnectorCredentialForUpdateParams{ID: credentialID, ConnectorID: connectorID, WorkspaceID: workspaceID}); errors.Is(err, pgx.ErrNoRows) {
-				writeError(w, http.StatusUnauthorized, "invalid connector credential")
-				return
-			} else if err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to revalidate connector credential")
-				return
-			}
+			return ""
 		}
-	}
-	if machine {
-		if err := qtx.UpdateConnectorCredentialLastUsed(r.Context(), db.UpdateConnectorCredentialLastUsedParams{ID: credentialID, ConnectorID: connectorID, WorkspaceID: workspaceID}); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to update connector credential usage")
-			return
-		}
-	}
-	fingerprint, err := ingestRequestFingerprint(req, connectorID, labels, fieldsObject, observedAt, req.ObservedAt != nil && strings.TrimSpace(*req.ObservedAt) != "")
+		return creatorID
+	}(), Machine: machine, SourceType: req.SourceType, ExternalID: req.ExternalID, Title: req.Title, IdempotencyKey: req.IdempotencyKey, SchemaVersion: ingestSchemaVersion(req.SchemaVersion), ExternalKey: optionalText(req.ExternalKey), Summary: optionalText(req.Summary), SourceStatus: optionalText(req.SourceStatus), SourceURL: optionalText(req.SourceURL), Labels: labels, Fields: fieldsObject, ObservedAt: observedAt, ObservedAtExplicit: req.ObservedAt != nil && strings.TrimSpace(*req.ObservedAt) != "", ValidatedTemplate: validatedTemplate, CreateParams: createParams, CreateOpts: createOpts, CreateIssue: req.CreateIssue != nil})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to fingerprint ingest request")
+		var ingestErr *service.WorkbenchIngestError
+		if errors.As(err, &ingestErr) {
+			writeError(w, ingestErr.Status, ingestErr.Message)
+		} else {
+			writeError(w, 500, "failed to ingest external record")
+		}
 		return
 	}
-	attempt, err := qtx.RecordOrBumpIntegrationIngestAttempt(r.Context(), db.RecordOrBumpIntegrationIngestAttemptParams{WorkspaceID: workspaceID, SourceType: strings.TrimSpace(req.SourceType), IdempotencyKey: strings.TrimSpace(req.IdempotencyKey), RequestFingerprint: fingerprint, ConnectorID: connectorID, ObservedAt: timestamptz(observedAt)})
-	if err != nil {
-		writeError(w, 500, "failed to record ingest attempt")
+	if result.Duplicate {
+		writeJSON(w, http.StatusOK, ingestResponse(externalRecordToResponse(result.ExistingRecord), result.Outcome, result.Attempt.AttemptCount, result.IssueID, result.ConnectorID, result.TemplateID, result.TemplateVersion))
 		return
 	}
-	if !attempt.Inserted {
-		if attempt.RequestFingerprint != "" && attempt.RequestFingerprint != fingerprint {
-			writeError(w, http.StatusConflict, "idempotency key was already used for a different request")
-			return
-		}
-		h.respondDuplicateIngest(w, r, tx, workspaceID, attempt, req.CreateIssue != nil)
-		return
-	}
-	var template db.IssueTemplate
-	if connectorID.Valid {
-		template, err = qtx.SelectMatchingIssueTemplate(r.Context(), db.SelectMatchingIssueTemplateParams{WorkspaceID: workspaceID, ConnectorID: connectorID, SourceStatus: optionalText(req.SourceStatus), Labels: labels, Fields: fieldsJSON})
-		if errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, http.StatusConflict, "matched issue template changed during ingest")
-			return
-		}
-		if err != nil {
-			writeError(w, 500, "failed to select issue template")
-			return
-		}
-		if template.ID != validatedTemplate.ID {
-			writeError(w, http.StatusConflict, "matched issue template changed during ingest")
-			return
-		}
-		status := template.Status
-		if !template.AutoStart {
-			status = "backlog"
-		}
-		description := pgtype.Text{}
-		switch template.DescriptionSource {
-		case "summary":
-			description = optionalText(req.Summary)
-		case "title":
-			description = pgtype.Text{String: strings.TrimSpace(req.Title), Valid: true}
-		}
-		creatorType := "member"
-		actorID := creatorID
-		if machine {
-			// The issue schema only accepts member/agent creators. A nil-FK neutral
-			// member UUID avoids impersonating the credential's created_by user.
-			creatorType = "member"
-			actorID = ""
-		}
-		createParams = service.IssueCreateParams{WorkspaceID: workspaceID, Title: template.TitlePrefix + strings.TrimSpace(req.Title), Description: description, Status: status, Priority: template.IssuePriority, AssigneeType: template.AssigneeType, AssigneeID: template.AssigneeID, CreatorType: creatorType, CreatorID: parseUUID(creatorID), AllowDuplicate: true}
-		createOpts = service.IssueCreateOpts{ActorID: actorID, SuppressActorFallback: machine, AnalyticsAgentID: templateAnalyticsAgent(template)}
-	}
-	record, err := qtx.UpsertExternalRecord(r.Context(), db.UpsertExternalRecordParams{WorkspaceID: workspaceID, SourceType: strings.TrimSpace(req.SourceType), ExternalID: strings.TrimSpace(req.ExternalID), Title: strings.TrimSpace(req.Title), SchemaVersion: ingestSchemaVersion(req.SchemaVersion), Labels: labels, Fields: fieldsJSON, ConnectorID: connectorID, ExternalKey: optionalText(req.ExternalKey), Summary: optionalText(req.Summary), SourceStatus: optionalText(req.SourceStatus), SourceUrl: optionalText(req.SourceURL), LastSeenAt: timestamptz(observedAt)})
-	if err != nil {
-		writeError(w, 500, "failed to store external record")
-		return
-	}
-	var postCommit *service.IssueCreatePostCommit
-	if req.CreateIssue != nil || connectorID.Valid {
-		created, pc, err := h.IssueService.CreateInTx(r.Context(), tx, createParams, createOpts)
-		if err != nil {
-			writeError(w, 500, "failed to create issue")
-			return
-		}
-		issueID = created.Issue.ID
-		postCommit = pc
-	}
-	if issueID.Valid {
-		if _, err := qtx.CreateIssueExternalRecordBinding(r.Context(), db.CreateIssueExternalRecordBindingParams{WorkspaceID: workspaceID, IssueID: issueID, ExternalRecordID: record.ID, BindingRole: "primary"}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			writeError(w, 500, "failed to bind external record to issue")
-			return
-		}
-	}
-	outcome := "updated"
-	if record.Inserted {
-		outcome = "created"
-	}
-	completed, err := qtx.CompleteIntegrationIngestAttempt(r.Context(), db.CompleteIntegrationIngestAttemptParams{ID: attempt.ID, ExternalRecordID: record.ID, Outcome: outcome, IssueID: issueID, ConnectorID: connectorID, IssueTemplateID: template.ID, IssueTemplateVersion: pgtype.Int4{Int32: template.Version, Valid: template.ID.Valid}})
-	if err != nil {
-		writeError(w, 500, "failed to complete ingest attempt")
-		return
-	}
-	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, "failed to commit ingest")
-		return
-	}
-	if postCommit != nil {
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), workbenchPostCommitTimeout)
-		postCommit.Run(ctx)
-		cancel()
-	}
-	response := ingestResponse(externalRecordUpsertToResponse(record), completed.Outcome, completed.AttemptCount, issueID, connectorID, template.ID, pgtype.Int4{Int32: template.Version, Valid: template.ID.Valid})
 	statusCode := http.StatusOK
-	if outcome == "created" {
+	if result.Outcome == "created" {
 		statusCode = http.StatusCreated
 	}
-	writeJSON(w, statusCode, response)
+	writeJSON(w, statusCode, ingestResponse(externalRecordUpsertToResponse(result.Record), result.Completed.Outcome, result.Completed.AttemptCount, result.IssueID, result.ConnectorID, result.TemplateID, result.TemplateVersion))
 }
 
 func (h *Handler) explicitIngestIssueParams(w http.ResponseWriter, r *http.Request, req IngestExternalRecordRequest, workspaceID pgtype.UUID, creatorID string) (service.IssueCreateParams, service.IssueCreateOpts, bool) {
@@ -1244,27 +1129,6 @@ func (h *Handler) explicitIngestIssueParams(w http.ResponseWriter, r *http.Reque
 		}
 		return ""
 	}()}, true
-}
-
-func (h *Handler) respondDuplicateIngest(w http.ResponseWriter, r *http.Request, tx pgx.Tx, workspaceID pgtype.UUID, attempt db.RecordOrBumpIntegrationIngestAttemptRow, explicitCreate bool) {
-	if err := tx.Commit(r.Context()); err != nil {
-		writeError(w, 500, "failed to commit ingest attempt")
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), workbenchPostCommitTimeout)
-	defer cancel()
-	if attempt.IssueID.Valid && (attempt.IssueTemplateID.Valid || explicitCreate) {
-		if err := h.IssueService.ReconcileNeverEnqueuedIssue(ctx, workspaceID, attempt.IssueID); err != nil {
-			writeError(w, 500, "failed to reconcile duplicate ingest")
-			return
-		}
-	}
-	record, err := h.Queries.GetExternalRecordInWorkspace(ctx, db.GetExternalRecordInWorkspaceParams{ID: attempt.ExternalRecordID, WorkspaceID: workspaceID})
-	if err != nil {
-		writeError(w, 409, "ingest is already processing")
-		return
-	}
-	writeJSON(w, http.StatusOK, ingestResponse(externalRecordToResponse(record), "duplicate", attempt.AttemptCount, attempt.IssueID, attempt.ConnectorID, attempt.IssueTemplateID, attempt.IssueTemplateVersion))
 }
 
 func (h *Handler) ListIssueExternalRecords(w http.ResponseWriter, r *http.Request) {
@@ -1439,46 +1303,6 @@ func normalizeLabels(values []string) ([]string, error) {
 	sort.Strings(out)
 	return out, nil
 }
-func ingestRequestFingerprint(req IngestExternalRecordRequest, connectorID pgtype.UUID, labels []string, fields map[string]any, observedAt time.Time, observedAtExplicit bool) (string, error) {
-	identity := struct {
-		ConnectorID   string                    `json:"connector_id"`
-		SourceType    string                    `json:"source_type"`
-		ExternalID    string                    `json:"external_id"`
-		ExternalKey   *string                   `json:"external_key,omitempty"`
-		Title         string                    `json:"title"`
-		Summary       *string                   `json:"summary,omitempty"`
-		SourceStatus  *string                   `json:"source_status,omitempty"`
-		SourceURL     *string                   `json:"source_url,omitempty"`
-		SchemaVersion string                    `json:"schema_version"`
-		IssueID       *string                   `json:"issue_id,omitempty"`
-		CreateIssue   *IngestCreateIssueRequest `json:"create_issue,omitempty"`
-		Labels        []string                  `json:"labels"`
-		Fields        map[string]any            `json:"fields"`
-		ObservedAt    string                    `json:"observed_at"`
-	}{
-		ConnectorID:   uuidToString(connectorID),
-		SourceType:    strings.TrimSpace(req.SourceType),
-		ExternalID:    strings.TrimSpace(req.ExternalID),
-		ExternalKey:   normalizedOptionalString(req.ExternalKey),
-		Title:         strings.TrimSpace(req.Title),
-		Summary:       normalizedOptionalString(req.Summary),
-		SourceStatus:  normalizedOptionalString(req.SourceStatus),
-		SourceURL:     normalizedOptionalString(req.SourceURL),
-		SchemaVersion: ingestSchemaVersion(req.SchemaVersion),
-		IssueID:       normalizedOptionalString(req.IssueID),
-		CreateIssue:   req.CreateIssue,
-		Labels:        labels,
-		Fields:        fields,
-	}
-	if observedAtExplicit {
-		identity.ObservedAt = observedAt.UTC().Format(time.RFC3339Nano)
-	}
-	encoded, err := json.Marshal(identity)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", sha256.Sum256(encoded)), nil
-}
 func defaultObject(value map[string]any) map[string]any {
 	if value == nil {
 		return map[string]any{}
@@ -1516,15 +1340,6 @@ func optionalText(value *string) pgtype.Text {
 		return pgtype.Text{}
 	}
 	return pgtype.Text{String: strings.TrimSpace(*value), Valid: true}
-}
-func timestamptz(value time.Time) pgtype.Timestamptz {
-	return pgtype.Timestamptz{Time: value, Valid: true}
-}
-func templateAnalyticsAgent(t db.IssueTemplate) string {
-	if t.AssigneeType.Valid && t.AssigneeType.String == "agent" {
-		return uuidToString(t.AssigneeID)
-	}
-	return ""
 }
 func ingestResponse(record ExternalRecordResponse, outcome string, count int32, issueID, connectorID, templateID pgtype.UUID, version pgtype.Int4) IngestExternalRecordResponse {
 	r := IngestExternalRecordResponse{ExternalRecord: record, Outcome: outcome, AttemptCount: count}

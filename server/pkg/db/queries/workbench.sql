@@ -252,6 +252,29 @@ SET connector_id = EXCLUDED.connector_id,
     updated_at = now()
 RETURNING *, (xmax = 0) AS inserted;
 
+
+-- name: GetOriginalIngestAuditForExternalRecord :one
+SELECT issue_id, connector_id, issue_template_id, issue_template_version
+FROM integration_ingest_attempt
+WHERE workspace_id = $1
+  AND external_record_id = $2
+  AND issue_id IS NOT NULL
+  AND outcome IN ('created', 'updated')
+ORDER BY created_at ASC, id ASC
+LIMIT 1
+FOR SHARE;
+
+-- name: GetPrimaryIssueBindingForExternalRecord :one
+SELECT b.issue_id, b.created_at
+FROM issue_external_record_binding b
+JOIN issue i ON i.id = b.issue_id AND i.workspace_id = b.workspace_id
+WHERE b.workspace_id = $1
+  AND b.external_record_id = $2
+  AND b.binding_role = 'primary'
+ORDER BY b.created_at ASC, b.id ASC
+LIMIT 1
+FOR SHARE OF b, i;
+
 -- name: CreateIssueExternalRecordBinding :one
 -- The joins are defense in depth: the binding is created only when both
 -- referenced records belong to the requested workspace.

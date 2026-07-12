@@ -911,6 +911,7 @@ func TestWorkbenchDisableConnectorPermissionsAndIdempotency(t *testing.T) {
 			t.Fatalf("disable %d returned enabled", i)
 		}
 	}
+
 }
 
 type workbenchRowCounts struct{ Attempts, Records, Issues, Bindings, Tasks int }

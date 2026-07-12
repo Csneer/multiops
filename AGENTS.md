@@ -36,6 +36,21 @@ Go backend + monorepo frontend (pnpm workspaces + Turborepo) with shared package
 - `packages/views/` - zero `next/*`, zero `react-router-dom`, use `NavigationAdapter` for routing
 - `apps/web/platform/` - only place for Next.js APIs
 
+### Workbench Connector Boundary (hard rules)
+
+Multica owns the Connector control plane and unified work model. External Connector runtimes own source-system protocol implementations.
+
+- Multica may own generic Connector registration, lifecycle, capabilities, machine authentication, health metadata, normalized ingest, External Record/Issue binding, templates, Agent routing, and generic delivery contracts.
+- A Connector is the required managed bridge to an external system. Register each external runtime and its capabilities in Multica, then bind its ingest and Agent tools through source-neutral contracts.
+- Do not add source-specific migrations, handlers, pollers, checkpoints, leases, API clients, workflow engines, or approval logic for Ferry, Jira, ZenTao, GitLab, or similar systems to Multica Core.
+- External API login, polling/webhooks, pagination/cursors, field conversion, and official API operations belong in a lightweight external Connector Runtime, MCP server, or Connector Service. A simple connector may remain a single script.
+- Agents are the runners. They call constrained Connector tools; Multica must not rebuild the external system's workflow.
+- Source credentials stay inside the trusted Connector Runtime or credential-isolating Tool Gateway. Never put reusable external credentials or Multica connector machine tokens in prompts, Issue content, Agent `mcp_config`, or Agent process environments.
+- Tool authorization must be enforced by the Connector/Gateway using workspace, connector, task, tool, operation, resource, and risk policy. Prompt instructions are not authorization.
+- Adding a data source should normally require no Multica schema or worker changes: inspect its official API, implement the common Connector ingest/tool contract, and register it.
+- Reuse the external system as the authority. Multica provides the management entry point and bridge; it must not become a shadow implementation of that system.
+- Before adding source-specific backend code, stop and obtain explicit architectural approval. Existing planning documents do not override this boundary.
+
 ### Commands
 
 ```bash

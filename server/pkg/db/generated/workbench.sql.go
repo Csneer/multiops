@@ -802,6 +802,71 @@ func (q *Queries) GetNextIssueTemplateVersion(ctx context.Context, arg GetNextIs
 	return version, err
 }
 
+const getOriginalIngestAuditForExternalRecord = `-- name: GetOriginalIngestAuditForExternalRecord :one
+SELECT issue_id, connector_id, issue_template_id, issue_template_version
+FROM integration_ingest_attempt
+WHERE workspace_id = $1
+  AND external_record_id = $2
+  AND issue_id IS NOT NULL
+  AND outcome IN ('created', 'updated')
+ORDER BY created_at ASC, id ASC
+LIMIT 1
+FOR SHARE
+`
+
+type GetOriginalIngestAuditForExternalRecordParams struct {
+	WorkspaceID      pgtype.UUID `json:"workspace_id"`
+	ExternalRecordID pgtype.UUID `json:"external_record_id"`
+}
+
+type GetOriginalIngestAuditForExternalRecordRow struct {
+	IssueID              pgtype.UUID `json:"issue_id"`
+	ConnectorID          pgtype.UUID `json:"connector_id"`
+	IssueTemplateID      pgtype.UUID `json:"issue_template_id"`
+	IssueTemplateVersion pgtype.Int4 `json:"issue_template_version"`
+}
+
+func (q *Queries) GetOriginalIngestAuditForExternalRecord(ctx context.Context, arg GetOriginalIngestAuditForExternalRecordParams) (GetOriginalIngestAuditForExternalRecordRow, error) {
+	row := q.db.QueryRow(ctx, getOriginalIngestAuditForExternalRecord, arg.WorkspaceID, arg.ExternalRecordID)
+	var i GetOriginalIngestAuditForExternalRecordRow
+	err := row.Scan(
+		&i.IssueID,
+		&i.ConnectorID,
+		&i.IssueTemplateID,
+		&i.IssueTemplateVersion,
+	)
+	return i, err
+}
+
+const getPrimaryIssueBindingForExternalRecord = `-- name: GetPrimaryIssueBindingForExternalRecord :one
+SELECT b.issue_id, b.created_at
+FROM issue_external_record_binding b
+JOIN issue i ON i.id = b.issue_id AND i.workspace_id = b.workspace_id
+WHERE b.workspace_id = $1
+  AND b.external_record_id = $2
+  AND b.binding_role = 'primary'
+ORDER BY b.created_at ASC, b.id ASC
+LIMIT 1
+FOR SHARE OF b, i
+`
+
+type GetPrimaryIssueBindingForExternalRecordParams struct {
+	WorkspaceID      pgtype.UUID `json:"workspace_id"`
+	ExternalRecordID pgtype.UUID `json:"external_record_id"`
+}
+
+type GetPrimaryIssueBindingForExternalRecordRow struct {
+	IssueID   pgtype.UUID        `json:"issue_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) GetPrimaryIssueBindingForExternalRecord(ctx context.Context, arg GetPrimaryIssueBindingForExternalRecordParams) (GetPrimaryIssueBindingForExternalRecordRow, error) {
+	row := q.db.QueryRow(ctx, getPrimaryIssueBindingForExternalRecord, arg.WorkspaceID, arg.ExternalRecordID)
+	var i GetPrimaryIssueBindingForExternalRecordRow
+	err := row.Scan(&i.IssueID, &i.CreatedAt)
+	return i, err
+}
+
 const getWorkbenchWebhookConnectorForDelivery = `-- name: GetWorkbenchWebhookConnectorForDelivery :one
 SELECT
     ci.id AS connector_id,

@@ -500,7 +500,7 @@ func TestConnectorResultDispatcherRoutesMixedConnectorTypes(t *testing.T) {
 	if response, err := dispatcher.DeliverResult(context.Background(), delivery); err != nil || response.StatusCode != 204 || len(webhook.calls) != 1 {
 		t.Fatalf("webhook route response=%+v err=%v calls=%d", response, err, len(webhook.calls))
 	}
-	if _, err := f.pool.Exec(context.Background(), `UPDATE connector_instance SET connector_type='ferry' WHERE id=$1`, f.connectorID); err != nil {
+	if _, err := f.pool.Exec(context.Background(), `UPDATE connector_instance SET connector_type='unsupported' WHERE id=$1`, f.connectorID); err != nil {
 		t.Fatal(err)
 	}
 	response, err := dispatcher.DeliverResult(context.Background(), delivery)
